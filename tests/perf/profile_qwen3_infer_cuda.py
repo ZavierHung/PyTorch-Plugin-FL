@@ -12,11 +12,32 @@ Usage:
 """
 
 import argparse
+import json
+import os
+import sys
 import time
 from collections import defaultdict
+from pathlib import Path
+
+
+def _patch_triton_math_shim():
+    """FlagGems on MetaX: triton.language.math lacks pow; use libdevice."""
+    try:
+        import triton.language.extra.libdevice as ld
+        import triton.language.math as tlm
+
+        for name in ("pow", "erf", "exp", "tanh", "rsqrt", "exp2"):
+            if not hasattr(tlm, name) and hasattr(ld, name):
+                setattr(tlm, name, getattr(ld, name))
+    except Exception:
+        pass
+
+
+_patch_triton_math_shim()
 
 import torch
 import torch_fl
+from torch.profiler import ProfilerActivity, profile, record_function
 from torch.utils._python_dispatch import TorchDispatchMode
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -89,6 +110,37 @@ class OpProfiler(TorchDispatchMode):
             avg_time_us = (total_time / count) * 1e6
             print(f"{op:50s} {count:5d} calls  {avg_time_us:7.1f}µs/call")
 
+    def to_dict(self):
+        total_op_time = sum(self.op_times.values()) or 1e-9
+        slowest = sorted(self.op_times.items(), key=lambda x: x[1], reverse=True)
+        return {
+            "total_unique_ops": len(self.op_counts),
+            "total_op_calls": sum(self.op_counts.values()),
+            "total_op_time_s": sum(self.op_times.values()),
+            "cpu_fallback_ops": dict(self.cpu_fallbacks),
+            "slowest_ops": [
+                {
+                    "op": op,
+                    "total_time_s": t,
+                    "pct": t / total_op_time * 100,
+                    "calls": self.op_counts[op],
+                    "avg_us": (t / self.op_counts[op]) * 1e6,
+                }
+                for op, t in slowest[:50]
+            ],
+            "most_frequent_ops": [
+                {
+                    "op": op,
+                    "calls": count,
+                    "total_time_s": self.op_times[op],
+                    "avg_us": (self.op_times[op] / count) * 1e6,
+                }
+                for op, count in sorted(
+                    self.op_counts.items(), key=lambda x: x[1], reverse=True
+                )[:50]
+            ],
+        }
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Profile Qwen3 inference on torch_fl")
@@ -104,12 +156,49 @@ def parse_args():
     parser.add_argument(
         "--warmup-rounds", type=int, default=2, help="Number of warmup rounds"
     )
+    parser.add_argument(
+        "--trace-dir",
+        default=None,
+        help="Directory to write Chrome trace JSON (open in chrome://tracing or Perfetto)",
+    )
+    parser.add_argument(
+        "--trace-round",
+        type=int,
+        default=0,
+        help="Which profiling round (1-based) captures torch.profiler trace; 0 = last round",
+    )
     return parser.parse_args()
+
+
+def _export_chrome_trace(trace_dir: Path, round_idx: int, model, gen_kwargs):
+    """One generate() pass with torch.profiler; writes trace_round{N}.json."""
+    trace_dir.mkdir(parents=True, exist_ok=True)
+    trace_path = trace_dir / f"trace_round{round_idx}.json"
+    activities = [ProfilerActivity.CPU]
+    if torch.cuda.is_available():
+        activities.append(ProfilerActivity.CUDA)
+
+    print(f"  Capturing Chrome trace -> {trace_path}")
+    torch_fl.flagos.synchronize()
+    with profile(
+        activities=activities,
+        record_shapes=True,
+        profile_memory=True,
+        with_stack=True,
+    ) as prof:
+        with record_function("qwen3_generate"):
+            with torch.no_grad():
+                _ = model.generate(**gen_kwargs)
+    torch_fl.flagos.synchronize()
+    prof.export_chrome_trace(str(trace_path))
+    print(f"  Chrome trace saved: {trace_path}")
+    return trace_path
 
 
 def main():
     args = parse_args()
     device = "flagos:0"
+    trace_dir = Path(args.trace_dir) if args.trace_dir else None
 
     print(f"Device: {device}")
     print(f"Device count: {torch_fl.flagos.device_count()}")
@@ -120,12 +209,21 @@ def main():
     # Load model
     print("Loading model...")
     t0 = time.time()
+    # Load on CPU first; moving to flagos triggers Triton JIT (mxcc) with no HF progress bar.
+    print("Loading model weights to CPU...")
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     model = AutoModelForCausalLM.from_pretrained(
         args.model, torch_dtype=torch.float16, device_map="cpu"
     )
-    model = model.to(device)
     model.eval()
+    print(
+        "Moving model to flagos:0 (first run compiles Triton kernels via mxcc; "
+        "may take 10-30+ min with no output — check: pstree -p <pid>)..."
+    )
+    sys.stdout.flush()
+    t_move = time.time()
+    model = model.to(device)
+    print(f"Model on {device} in {time.time() - t_move:.1f}s")
     # Force eager attention to match baseline
     model.model.layers[0].self_attn.config._attn_implementation = "eager"
     print(f"Model loaded in {time.time() - t0:.2f}s")
@@ -198,6 +296,10 @@ def main():
         round_tps.append(tps)
         print(f"  Round {i + 1}: {elapsed:.2f}s, {new_tokens} tokens, {tps:.2f} tok/s")
 
+    if trace_dir:
+        trace_round = args.trace_round if args.trace_round > 0 else args.rounds
+        _export_chrome_trace(trace_dir, trace_round, model, gen_kwargs)
+
     # Statistics
     round_times.sort()
     round_tps.sort()
@@ -238,6 +340,26 @@ def main():
     print(f"Ops per token:  {ops_per_round / tokens_per_round:.0f}")
     avg_op_time_us = (op_time_per_round / ops_per_round) * 1e6
     print(f"Avg op time:    {avg_op_time_us:.1f}µs")
+
+    if trace_dir:
+        trace_dir.mkdir(parents=True, exist_ok=True)
+        summary_path = trace_dir / "op_profile_summary.json"
+        payload = {
+            "device": device,
+            "model": args.model,
+            "tokens_per_round": args.tokens,
+            "rounds": args.rounds,
+            "warmup_rounds": args.warmup_rounds,
+            "median_time_s": median_time,
+            "median_tps": median_tps,
+            "op_profile": profiler.to_dict(),
+        }
+        summary_path.write_text(json.dumps(payload, indent=2))
+        print(f"\nOp summary JSON: {summary_path}")
+        print(
+            "Chrome trace: open trace_round*.json in https://ui.perfetto.dev "
+            "or chrome://tracing"
+        )
 
 
 if __name__ == "__main__":

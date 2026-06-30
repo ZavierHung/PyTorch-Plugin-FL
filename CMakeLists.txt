@@ -8,6 +8,7 @@ option(FLAGGEMS_KERNEL "Build FlagGems C++ kernel wrappers (requires liboperator
 option(FLAGGEMS_PYTHON "Build FlagGems Python kernel wrappers (calls via Python, no C++ linking)" OFF)
 option(METAX_KERNEL "Build MetaX kernel implementations" OFF)
 option(ASCEND_KERNEL "Build Ascend kernel implementations" OFF)
+option(USE_MACA "Compile against MetaX (mc)PyTorch headers" OFF)
 
 if(ACCELERATOR STREQUAL "ascend")
   project(TORCH_FLAGOS CXX C)
@@ -16,6 +17,7 @@ elseif(ACCELERATOR STREQUAL "metax")
   set(METAX_KERNEL ON CACHE BOOL "Build MetaX kernel implementations" FORCE)
   set(CUDA_KERNEL OFF CACHE BOOL "Build CUDA kernel implementations" FORCE)
   set(FLAGGEMS_KERNEL OFF CACHE BOOL "Build FlagGems kernel implementations" FORCE)
+  set(USE_MACA ON CACHE BOOL "Compile against MetaX (mc)PyTorch headers" FORCE)
   project(TORCH_FLAGOS CXX C)
 else()
   # project(... CUDA) runs nvcc compiler-id before find_package(CUDAToolkit); conda

@@ -11,6 +11,21 @@ Usage:
 import argparse
 import time
 
+
+def _patch_triton_math_shim():
+    try:
+        import triton.language.extra.libdevice as ld
+        import triton.language.math as tlm
+
+        for name in ("pow", "erf", "exp", "tanh", "rsqrt", "exp2"):
+            if not hasattr(tlm, name) and hasattr(ld, name):
+                setattr(tlm, name, getattr(ld, name))
+    except Exception:
+        pass
+
+
+_patch_triton_math_shim()
+
 import torch
 import torch_fl
 from transformers import AutoModelForCausalLM, AutoTokenizer

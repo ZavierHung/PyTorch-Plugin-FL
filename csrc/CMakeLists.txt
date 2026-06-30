@@ -18,7 +18,11 @@ list(FILTER SOURCE_FILES EXCLUDE REGEX ".*/runtime/accelerator/ascend/stream_api
 
 # Exclude backend kernel directories based on options
 if(NOT CUDA_KERNEL)
-  list(FILTER SOURCE_FILES EXCLUDE REGEX ".*/aten/backends/cuda/.*")
+  list(FILTER SOURCE_FILES EXCLUDE REGEX ".*/aten/backends/cuda/.*\\.cu$")
+endif()
+# MetaX PyTorch lacks ATen reduce CUDA templates used by mean/sum kernels.
+if(USE_MACA OR ACCELERATOR STREQUAL "metax" OR EXISTS "/opt/maca")
+  list(FILTER SOURCE_FILES EXCLUDE REGEX ".*/aten/backends/cuda/(mean|sum)\\.cu$")
 endif()
 if(NOT FLAGGEMS_KERNEL AND NOT FLAGGEMS_PYTHON)
   # Neither C++ nor Python wrappers: exclude entire flagos backend
@@ -35,15 +39,18 @@ if(NOT ASCEND_KERNEL)
 endif()
 
 if(ACCELERATOR STREQUAL "metax")
-  list(FILTER SOURCE_FILES EXCLUDE REGEX ".*/aten/backends/cuda/.*")
+  # Keep CUDA .cc wrappers (argmax, sort, …) for DeviceBoxingGuard; device kernels stay .cu → mxcc
+  list(FILTER SOURCE_FILES EXCLUDE REGEX ".*/aten/backends/cuda/.*\\.cu$")
   list(FILTER SOURCE_FILES EXCLUDE REGEX ".*/aten/backends/metax/.*\\.cu$")
+  list(FILTER SOURCE_FILES EXCLUDE REGEX ".*/aten/backends/metax_opt/.*\\.cu$")
+  list(FILTER SOURCE_FILES EXCLUDE REGEX ".*/aten/backends/metax_v2/.*\\.cu$")
 endif()
 
 set(_torch_fl_sources ${SOURCE_FILES})
 
 if(ACCELERATOR STREQUAL "metax" AND METAX_KERNEL)
   include(${CMAKE_SOURCE_DIR}/cmake/MetaxKernels.cmake)
-  flagos_add_metax_kernel_objects(_flagos_metax_kernel_objs)
+  flagos_add_all_metax_kernel_objects(_flagos_metax_kernel_objs)
   list(APPEND _torch_fl_sources ${_flagos_metax_kernel_objs})
 endif()
 
@@ -69,6 +76,9 @@ endif()
 target_compile_definitions(${LIBRARY_NAME} PRIVATE
     FLAGOS_SOURCE_ROOT="${CMAKE_SOURCE_DIR}"
 )
+if(USE_MACA)
+  target_compile_definitions(${LIBRARY_NAME} PRIVATE USE_MACA=1)
+endif()
 
 set(_torch_fl_link_libs torch_cpu_library torch_python_library flagos ${CUDA_RUNTIME_LIB})
 if(FLAGGEMS_KERNEL)
@@ -105,7 +115,9 @@ if(ACCELERATOR STREQUAL "metax")
     "${METAX_PATH}/tools/cu-bridge/include"
     "${METAX_PATH}/include"
     "${METAX_PATH}/include/mcr"
-    "${CMAKE_CURRENT_SOURCE_DIR}/aten/backends/metax")
+    "${CMAKE_CURRENT_SOURCE_DIR}/aten/backends/metax"
+    "${CMAKE_CURRENT_SOURCE_DIR}/aten/backends/metax_opt"
+    "${CMAKE_CURRENT_SOURCE_DIR}/aten/backends/metax_v2")
 
   find_library(MCBLAS_LIB mcblas
       PATHS "${METAX_PATH}/lib"

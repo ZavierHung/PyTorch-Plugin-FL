@@ -78,6 +78,10 @@ std::unordered_map<std::string, Backend> LoadBackendConfig() {
       table[op] = Backend::kCuda;
     } else if (val == "metax") {
       table[op] = Backend::kMetax;
+    } else if (val == "metax_opt") {
+      table[op] = Backend::kMetaxOpt;
+    } else if (val == "metax_v2") {
+      table[op] = Backend::kMetaxV2;
     } else if (val == "ascend") {
       table[op] = Backend::kAscend;
     } else if (val == "flagos" || val == "flaggems") {
@@ -109,6 +113,12 @@ std::unordered_map<std::string, Backend> LoadBackendConfig() {
     } else if (v == "metax") {
       table[op] = Backend::kMetax;
       fprintf(stderr, "[flagos] env override: %s -> metax\n", op.c_str());
+    } else if (v == "metax_opt") {
+      table[op] = Backend::kMetaxOpt;
+      fprintf(stderr, "[flagos] env override: %s -> metax_opt\n", op.c_str());
+    } else if (v == "metax_v2") {
+      table[op] = Backend::kMetaxV2;
+      fprintf(stderr, "[flagos] env override: %s -> metax_v2\n", op.c_str());
     } else if (v == "ascend") {
       table[op] = Backend::kAscend;
       fprintf(stderr, "[flagos] env override: %s -> ascend\n", op.c_str());

@@ -243,6 +243,10 @@ FORWARD(cudaError_t, cudaMallocAsync,
     (void **devPtr, size_t size, cudaStream_t hStream),
     (devPtr, size, hStream))
 
+FORWARD(cudaError_t, cudaMallocHost,
+    (void **ptr, size_t size),
+    (ptr, size))
+
 FORWARD(cudaError_t, cudaMemGetInfo,
     (size_t *free_mem, size_t *total),
     (free_mem, total))

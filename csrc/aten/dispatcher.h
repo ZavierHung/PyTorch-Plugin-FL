@@ -53,6 +53,8 @@ class Dispatcher {
       case Backend::kAscend:        ascend_fn_ = fn;         break;
       case Backend::kMusa:          musa_fn_ = fn;           break;
       case Backend::kMetax:         metax_fn_ = fn;          break;
+      case Backend::kMetaxOpt:     metax_opt_fn_ = fn;      break;
+      case Backend::kMetaxV2:       metax_v2_fn_ = fn;       break;
     }
   }
 
@@ -79,6 +81,8 @@ class Dispatcher {
       case Backend::kAscend:        return ascend_fn_;
       case Backend::kMusa:          return musa_fn_;
       case Backend::kMetax:         return metax_fn_;
+      case Backend::kMetaxOpt:     return metax_opt_fn_;
+      case Backend::kMetaxV2:       return metax_v2_fn_;
     }
     return nullptr;
   }
@@ -97,6 +101,8 @@ class Dispatcher {
       case Backend::kAscend:        name = "ascend"; break;
       case Backend::kMusa:          name = "musa"; break;
       case Backend::kMetax:         name = "metax"; break;
+      case Backend::kMetaxOpt:     name = "metax_opt"; break;
+      case Backend::kMetaxV2:       name = "metax_v2"; break;
       default:                           name = "unknown"; break;
     }
     fprintf(stderr, "[flagos dispatch] %s -> %s\n", op_name.c_str(), name);
@@ -109,6 +115,8 @@ class Dispatcher {
   FnPtr ascend_fn_         = nullptr;
   FnPtr musa_fn_           = nullptr;
   FnPtr metax_fn_          = nullptr;
+  FnPtr metax_opt_fn_      = nullptr;
+  FnPtr metax_v2_fn_       = nullptr;
 };
 
 namespace detail {
