@@ -2,9 +2,11 @@
 
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <limits>
 #include <type_traits>
+#include <utility>
 
 #include <ATen/Dispatch.h>
 #include <ATen/OpMathType.h>
@@ -70,29 +72,145 @@ struct GemmExConfig<at::BFloat16> {
   static constexpr mcblasComputeType_t compute_type = MCBLAS_COMPUTE_32F_FAST_16BF;
 };
 
+struct PreparedMmMatrix {
+  at::Tensor tensor;
+  bool owned = false;
+};
+
+// PyTorch cublasCommonArgs-style layout resolution (2-D).
+PreparedMmMatrix PrepareMatrixForMcblas(
+    const at::Tensor& tensor,
+    bool& transpose_tensor,
+    bool transpose_result) {
+  PreparedMmMatrix prepared;
+  if (tensor.is_non_overlapping_and_dense()) {
+    transpose_tensor = tensor.is_contiguous();
+    prepared.tensor = tensor;
+    return prepared;
+  }
+
+  const int64_t s0 = tensor.stride(0);
+  const int64_t s1 = tensor.stride(1);
+  const int64_t r = tensor.size(0);
+  const int64_t c = tensor.size(1);
+  if (s0 == 1 && s1 >= std::max<int64_t>(1, r)) {
+    transpose_tensor = false;
+    prepared.tensor = tensor;
+  } else if (s1 == 1 && s0 >= std::max<int64_t>(1, c)) {
+    transpose_tensor = true;
+    prepared.tensor = tensor;
+  } else {
+    transpose_tensor = true;
+    prepared.tensor = tensor.contiguous();
+    prepared.owned = true;
+  }
+  return prepared;
+}
+
+bool PrepareResultTransposeFlag(const at::Tensor& result) {
+  if (result.is_non_overlapping_and_dense()) {
+    return result.is_contiguous();
+  }
+  const int64_t s0 = result.stride(0);
+  const int64_t s1 = result.stride(1);
+  const int64_t r = result.size(0);
+  const int64_t c = result.size(1);
+  if (s0 == 1 && s1 >= std::max<int64_t>(1, r)) {
+    return false;
+  }
+  if (s1 == 1 && s0 >= std::max<int64_t>(1, c)) {
+    return true;
+  }
+  return true;
+}
+
+template <typename scalar_t>
+struct McblasMmLaunchArgs {
+  const scalar_t* a_ptr = nullptr;
+  const scalar_t* b_ptr = nullptr;
+  scalar_t* c_ptr = nullptr;
+  mcblasOperation_t op_a = MCBLAS_OP_N;
+  mcblasOperation_t op_b = MCBLAS_OP_N;
+  int m = 0;
+  int n = 0;
+  int k = 0;
+  int lda = 0;
+  int ldb = 0;
+  int ldc = 0;
+  at::Tensor out_work;
+  PreparedMmMatrix mat_a_prepared;
+  PreparedMmMatrix mat_b_prepared;
+};
+
+template <typename scalar_t>
+McblasMmLaunchArgs<scalar_t> BuildMcblasMmArgs(
+    const at::Tensor& self,
+    const at::Tensor& mat2,
+    at::Tensor& out) {
+  McblasMmLaunchArgs<scalar_t> args;
+  const bool transpose_result = PrepareResultTransposeFlag(out);
+
+  bool transpose_a = false;
+  bool transpose_b = false;
+  args.mat_a_prepared = PrepareMatrixForMcblas(
+      transpose_result ? mat2 : self, transpose_a, transpose_result);
+  args.mat_b_prepared = PrepareMatrixForMcblas(
+      transpose_result ? self : mat2, transpose_b, transpose_result);
+
+  if (transpose_result) {
+    transpose_a = !transpose_a;
+    transpose_b = !transpose_b;
+  }
+
+  const at::Tensor& mata = args.mat_a_prepared.tensor;
+  const at::Tensor& matb = args.mat_b_prepared.tensor;
+
+  const int64_t m64 = mata.size(transpose_result ? 1 : 0);
+  const int64_t k64 = mata.size(transpose_result ? 0 : 1);
+  const int64_t n64 = matb.size(transpose_result ? 0 : 1);
+  TORCH_CHECK(
+      m64 <= std::numeric_limits<int>::max() &&
+          n64 <= std::numeric_limits<int>::max() &&
+          k64 <= std::numeric_limits<int>::max(),
+      "MetaX mm: shape too large for mcblasGemmEx int32 dimensions");
+  TORCH_CHECK(
+      self.size(1) == mat2.size(0),
+      "MetaX mm: shape mismatch");
+
+  args.m = static_cast<int>(m64);
+  args.k = static_cast<int>(k64);
+  args.n = static_cast<int>(n64);
+  args.lda = static_cast<int>(
+      mata.stride((transpose_a == transpose_result) ? 1 : 0));
+  args.ldb = static_cast<int>(
+      matb.stride((transpose_b == transpose_result) ? 1 : 0));
+
+  args.op_a = transpose_a ? MCBLAS_OP_T : MCBLAS_OP_N;
+  args.op_b = transpose_b ? MCBLAS_OP_T : MCBLAS_OP_N;
+
+  if (out.is_contiguous()) {
+    args.out_work = out;
+    args.ldc = static_cast<int>(out.stride(transpose_result ? 0 : 1));
+    args.c_ptr = out.template data_ptr<scalar_t>();
+  } else {
+    args.out_work = at::empty(
+        out.sizes(),
+        out.options().memory_format(at::MemoryFormat::Contiguous));
+    args.ldc = static_cast<int>(args.out_work.stride(0));
+    args.c_ptr = args.out_work.template data_ptr<scalar_t>();
+  }
+
+  args.a_ptr = mata.template data_ptr<scalar_t>();
+  args.b_ptr = matb.template data_ptr<scalar_t>();
+  return args;
+}
+
 template <typename scalar_t>
 void LaunchMmMcblasV2(
     const at::Tensor& self,
     const at::Tensor& mat2,
     at::Tensor& out) {
-  const at::Tensor a = self.is_contiguous() ? self : self.contiguous();
-  const at::Tensor b = mat2.is_contiguous() ? mat2 : mat2.contiguous();
-  const int64_t m = a.size(0);
-  const int64_t k = a.size(1);
-  const int64_t n = b.size(1);
-  TORCH_CHECK(b.size(0) == k, "MetaX mm: shape mismatch");
-  TORCH_CHECK(
-      m <= std::numeric_limits<int>::max() &&
-          n <= std::numeric_limits<int>::max() &&
-          k <= std::numeric_limits<int>::max(),
-      "MetaX mm: shape too large for mcblasGemmEx int32 dimensions");
-
-  at::Tensor out_work = out;
-  if (!out.is_contiguous()) {
-    out_work = at::empty(
-        out.sizes(),
-        out.options().memory_format(at::MemoryFormat::Contiguous));
-  }
+  auto args = BuildMcblasMmArgs<scalar_t>(self, mat2, out);
 
   const auto handle = GetMcblasHandle();
   const mcblasStatus_t set_stream_status =
@@ -106,53 +224,44 @@ void LaunchMmMcblasV2(
   const typename cfg::alpha_t alpha = static_cast<typename cfg::alpha_t>(1);
   const typename cfg::alpha_t beta = static_cast<typename cfg::alpha_t>(0);
 
-  // Row-major A(m,k) * B(k,n) can be computed via column-major:
-  // C_col(n,m) = B_col(n,k) * A_col(k,m)
-  const int m_col = static_cast<int>(n);
-  const int n_col = static_cast<int>(m);
-  const int k_col = static_cast<int>(k);
-  const int lda = static_cast<int>(n);
-  const int ldb = static_cast<int>(k);
-  const int ldc = static_cast<int>(n);
-
   mcblasStatus_t status = MCBLAS_STATUS_SUCCESS;
   if constexpr (std::is_same_v<scalar_t, at::Half>) {
     at::Half alpha_h = at::Half(1.0f);
     at::Half beta_h = at::Half(0.0f);
     status = mcblasHgemm(
         handle,
-        MCBLAS_OP_N,
-        MCBLAS_OP_N,
-        m_col,
-        n_col,
-        k_col,
+        args.op_a,
+        args.op_b,
+        args.m,
+        args.n,
+        args.k,
         reinterpret_cast<const mcblas_half*>(&alpha_h),
-        reinterpret_cast<const mcblas_half*>(b.data_ptr<at::Half>()),
-        lda,
-        reinterpret_cast<const mcblas_half*>(a.data_ptr<at::Half>()),
-        ldb,
+        reinterpret_cast<const mcblas_half*>(args.a_ptr),
+        args.lda,
+        reinterpret_cast<const mcblas_half*>(args.b_ptr),
+        args.ldb,
         reinterpret_cast<const mcblas_half*>(&beta_h),
-        reinterpret_cast<mcblas_half*>(out_work.data_ptr<at::Half>()),
-        ldc);
+        reinterpret_cast<mcblas_half*>(args.c_ptr),
+        args.ldc);
   } else {
     status = mcblasGemmEx(
         handle,
-        MCBLAS_OP_N,
-        MCBLAS_OP_N,
-        m_col,
-        n_col,
-        k_col,
+        args.op_a,
+        args.op_b,
+        args.m,
+        args.n,
+        args.k,
         &alpha,
-        b.data_ptr<scalar_t>(),
+        args.a_ptr,
         cfg::type,
-        lda,
-        a.data_ptr<scalar_t>(),
+        args.lda,
+        args.b_ptr,
         cfg::type,
-        ldb,
+        args.ldb,
         &beta,
-        out_work.data_ptr<scalar_t>(),
+        args.c_ptr,
         cfg::type,
-        ldc,
+        args.ldc,
         cfg::compute_type,
         MCBLAS_GEMM_DEFAULT);
   }
@@ -163,7 +272,7 @@ void LaunchMmMcblasV2(
       mcblasGetStatusString(status));
 
   if (!out.is_contiguous()) {
-    out.copy_(out_work);
+    out.copy_(args.out_work);
   }
 }
 #endif

@@ -5,17 +5,15 @@
 
 #include <include/flagos.h>
 
+#include "copy_path_v2.h"
+
 namespace at::native::flagos {
 
 namespace {
 
 at::Tensor CloneContiguousD2dV2(const at::Tensor& self) {
   auto result = at::empty_like(self);
-  const size_t nbytes =
-      static_cast<size_t>(self.numel()) * static_cast<size_t>(self.element_size());
-  if (nbytes > 0) {
-    Memcpy(result.data_ptr(), self.data_ptr(), nbytes, MemcpyDeviceToDevice);
-  }
+  MetaxStridedCopyV2(self, result);
   return result;
 }
 
@@ -41,7 +39,9 @@ at::Tensor ToCopyKernelMetaxV2(
     if (self.is_contiguous(resolved_format)) {
       return CloneContiguousD2dV2(self);
     }
-    return contiguous(self, resolved_format);
+    auto result = at::empty_like(self, self.options().memory_format(resolved_format));
+    MetaxStridedCopyV2(self, result);
+    return result;
   }
 
   return at::native::flagos::_to_copy(

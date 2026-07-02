@@ -19,19 +19,25 @@ BACKENDS = [
         "native_maca",
         None,
         False,
-        "cuda:0 · 无 torch_fl",
+        "cuda:0 · 原生 MACA ATen/cu-bridge",
+    ),
+    (
+        "pure_metax_baseline",
+        str(REPO / "torch_fl" / "backends_metax_baseline.conf"),
+        False,
+        "flagos:0 · Top10 metax 初版 kernel",
     ),
     (
         "pure_metax_v2",
         str(REPO / "torch_fl" / "backends_metax_v2.conf"),
         False,
-        "flagos:0 · Top10/非Top10 见 backends_metax_v2.conf",
+        "flagos:0 · Top10 metax_v2（当前优化）",
     ),
     (
         "hybrid_metax_v2",
         str(REPO / "torch_fl" / "backends_metax_flagos_py_v2.conf"),
         True,
-        "flagos:0 · Top10 metax_v2 + silu/cos 等 flagos_python",
+        "flagos:0 · FlagGems + metax_v2 fallback",
     ),
 ]
 
@@ -40,6 +46,66 @@ def spread_pct(times: list[float]) -> float:
     s = sorted(times)
     med = s[len(s) // 2]
     return (s[-1] - s[0]) / med * 100 if med else 0.0
+
+
+def write_summary_md(out: Path, meta: dict, results: list[dict]) -> None:
+    native_tps = next((r["median_tps"] for r in results if r["name"] == "native_maca"), 0)
+    v2_tps = next((r["median_tps"] for r in results if r["name"] == "pure_metax_v2"), 0)
+    lines = [
+        "# TPS 低噪声 E2E 对比",
+        "",
+        f"> {meta['timestamp_utc']}",
+        "",
+        "## 协议",
+        "",
+        f"- 模型: `{meta['model']}`",
+        f"- 新 token: **{meta['tokens']}** (greedy, eager attention)",
+        f"- warmup: {results[0]['warmup_rounds']} · timed: {results[0]['timed_rounds']} · "
+        f"discard-first: {results[0]['discard_first']}",
+        "",
+        "## 结果（median tok/s）",
+        "",
+        "| 变体 | 设备 | Median 耗时 | **TPS** | vs native | vs metax_v2 | Spread |",
+        "|------|------|-------------|---------|-----------|-------------|--------|",
+    ]
+    for r in results:
+        vs_native = r["median_tps"] / native_tps if native_tps else 0
+        vs_v2 = r["median_tps"] / v2_tps if v2_tps else 0
+        conf_short = Path(r["conf"]).name if r["conf"] else "—"
+        lines.append(
+            f"| `{r['name']}` | `{r['device']}` | {r['median_time_s']:.3f}s | "
+            f"**{r['median_tps']:.2f}** | {vs_native:.2f}× | {vs_v2:.2f}× | "
+            f"{r['spread_pct']:.1f}% |"
+        )
+    lines.extend(
+        [
+            "",
+            "## 说明",
+            "",
+        ]
+    )
+    for r in results:
+        lines.append(f"- **{r['name']}**: {r['note']}")
+        if r["conf"]:
+            lines.append(f"  - conf: `{Path(r['conf']).name}`")
+    lines.extend(
+        [
+            "",
+            "## 复现",
+            "",
+            "```bash",
+            "source /home/hongzw/setup_metax_env.sh",
+            "cd /home/hongzw/PyTorch-Plugin-FL",
+            "python scripts/run_experiment_b_lownoise.py \\",
+            f"  --warmup-rounds {results[0]['warmup_rounds']} "
+            f"--rounds {results[0]['timed_rounds']} "
+            f"--discard-first {results[0]['discard_first']} \\",
+            f"  --out-dir {out}",
+            "```",
+            "",
+        ]
+    )
+    (out / "TPS_E2E_LOWNOISE.md").write_text("\n".join(lines), encoding="utf-8")
 
 
 def main():
@@ -122,7 +188,9 @@ def main():
     (out / "experiment_b_lownoise.json").write_text(
         json.dumps(payload, indent=2), encoding="utf-8"
     )
+    write_summary_md(out, payload["meta"], results)
     print(f"\nJSON: {out / 'experiment_b_lownoise.json'}")
+    print(f"Report: {out / 'TPS_E2E_LOWNOISE.md'}")
 
 
 if __name__ == "__main__":

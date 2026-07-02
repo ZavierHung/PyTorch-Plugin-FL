@@ -97,7 +97,7 @@ endfunction()
 function(flagos_add_all_metax_kernel_objects out_var)
   set(_baseline_kernels add mul le all neg embedding mean mm bmm cos sin rsqrt silu pow sum ones_like softmax where bitwise_and)
   set(_opt_kernels add_opt mul_opt mean_opt mm_opt bmm_opt pow_opt rsqrt_opt)
-  set(_v2_kernels add_v2 mul_v2 mean_v2 mm_v2 bmm_v2 pow_v2 rsqrt_v2 copy_v2)
+  set(_v2_kernels add_v2 mul_v2 mean_v2 mm_v2 bmm_v2 pow_v2 rsqrt_v2 copy_v2 cat_v2_fused elementwise_vec_v2 elementwise_offset_v2 elementwise_broadcast_v2)
 
   flagos_add_metax_kernel_objects(_baseline_objs metax "${_baseline_kernels}")
   flagos_add_metax_kernel_objects(_opt_objs metax_opt "${_opt_kernels}")
