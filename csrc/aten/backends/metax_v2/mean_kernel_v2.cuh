@@ -147,45 +147,47 @@ MeanAlongDimBlockReduceBody(
     out_t* __restrict__ out,
     const scalar_t* __restrict__ in,
     acc_t inv_reduce) {
+  // MetaX C500 wavefront size is 64. All warp-shuffle constants below are
+  // derived from WARP=64, not the CUDA-default 32.
   constexpr int BLOCK = 256;
-  constexpr int WARPS = BLOCK / 32;
+  constexpr int WARP = 64;
+  constexpr int WARPS = BLOCK / WARP;
+  // One block reduces one (outer, inner) slot — all BLOCK threads cooperate
+  // on the same reduce axis. Do NOT pack multiple inner slots per block: that
+  // would make __shfl_down_sync mix sums from different slots.
   const int64_t outer_idx = static_cast<int64_t>(blockIdx.x);
-  const int64_t inner_idx =
-      static_cast<int64_t>(blockIdx.y) * blockDim.x + threadIdx.x;
-  if (outer_idx >= outer || inner_idx >= inner) {
-    return;
-  }
+  const int64_t inner_idx = static_cast<int64_t>(blockIdx.y);
+  const bool valid = (outer_idx < outer) && (inner_idx < inner);
   const int64_t base_in = outer_idx * reduce * inner + inner_idx;
+  // Every thread participates in the shuffle reduce (out-of-bounds threads
+  // contribute 0); only the write-back is guarded by `valid`.
   acc_t thread_sum = acc_t(0);
-  if (inner == 1) {
-    const scalar_t* row = in + base_in;
-    const int64_t r_start = threadIdx.x;
-    if (r_start < reduce) {
-      const int64_t chunk = (reduce - r_start + BLOCK - 1) / BLOCK;
-      const int64_t r_end = r_start + chunk * BLOCK;
-      for (int64_t r = r_start; r < r_end && r < reduce; r += BLOCK) {
+  if (valid) {
+    if (inner == 1) {
+      const scalar_t* row = in + base_in;
+      for (int64_t r = threadIdx.x; r < reduce; r += BLOCK) {
         thread_sum += static_cast<acc_t>(LoadInput(row + r));
       }
-    }
-  } else {
-    for (int64_t r = threadIdx.x; r < reduce; r += BLOCK) {
-      thread_sum += static_cast<acc_t>(LoadInput(in + base_in + r * inner));
+    } else {
+      for (int64_t r = threadIdx.x; r < reduce; r += BLOCK) {
+        thread_sum += static_cast<acc_t>(LoadInput(in + base_in + r * inner));
+      }
     }
   }
-  for (int offset = 16; offset > 0; offset >>= 1) {
-    thread_sum += __shfl_down_sync(0xffffffffu, thread_sum, offset);
+  for (int offset = WARP / 2; offset > 0; offset >>= 1) {
+    thread_sum += __shfl_down_sync(0xffffffffffffffffull, thread_sum, offset);
   }
   __shared__ acc_t warp_sums[WARPS];
-  const int lane = threadIdx.x & 31;
-  const int warp_id = threadIdx.x >> 5;
+  const int lane = threadIdx.x & (WARP - 1);
+  const int warp_id = threadIdx.x / WARP;
   if (lane == 0) warp_sums[warp_id] = thread_sum;
   __syncthreads();
   if (warp_id == 0) {
     acc_t v = (threadIdx.x < WARPS) ? warp_sums[threadIdx.x] : acc_t(0);
     for (int offset = WARPS / 2; offset > 0; offset >>= 1) {
-      v += __shfl_down_sync(0xffffffffu, v, offset);
+      v += __shfl_down_sync(0xffffffffffffffffull, v, offset);
     }
-    if (threadIdx.x == 0) {
+    if (threadIdx.x == 0 && valid) {
       out[outer_idx * inner + inner_idx] = static_cast<out_t>(v * inv_reduce);
     }
   }
@@ -260,42 +262,42 @@ MeanAlongDimSplitKReduceBody(
     acc_t* __restrict__ partials,
     const scalar_t* __restrict__ in) {
   constexpr int BLOCK = 256;
+  constexpr int WARP = 64;
+  constexpr int WARPS = BLOCK / WARP;
   const int64_t outer_idx = static_cast<int64_t>(blockIdx.x);
-  const int64_t inner_idx =
-      static_cast<int64_t>(blockIdx.y) * blockDim.x + threadIdx.x;
+  const int64_t inner_idx = static_cast<int64_t>(blockIdx.y);
   const int64_t split_idx = static_cast<int64_t>(blockIdx.z);
-  if (outer_idx >= outer || inner_idx >= inner) {
-    return;
-  }
+  const bool valid = (outer_idx < outer) && (inner_idx < inner);
   const int64_t base_in = outer_idx * reduce * inner + inner_idx;
   const int64_t r_start = split_idx * reduce_per_block;
   const int64_t r_end = std::min(r_start + reduce_per_block, reduce);
   acc_t thread_sum = acc_t(0);
-  if (inner == 1) {
-    const scalar_t* row = in + base_in;
-    for (int64_t r = r_start + threadIdx.x; r < r_end; r += BLOCK) {
-      thread_sum += static_cast<acc_t>(LoadInput(row + r));
-    }
-  } else {
-    for (int64_t r = r_start + threadIdx.x; r < r_end; r += BLOCK) {
-      thread_sum += static_cast<acc_t>(LoadInput(in + base_in + r * inner));
+  if (valid) {
+    if (inner == 1) {
+      const scalar_t* row = in + base_in;
+      for (int64_t r = r_start + threadIdx.x; r < r_end; r += BLOCK) {
+        thread_sum += static_cast<acc_t>(LoadInput(row + r));
+      }
+    } else {
+      for (int64_t r = r_start + threadIdx.x; r < r_end; r += BLOCK) {
+        thread_sum += static_cast<acc_t>(LoadInput(in + base_in + r * inner));
+      }
     }
   }
-  for (int offset = 16; offset > 0; offset >>= 1) {
-    thread_sum += __shfl_down_sync(0xffffffffu, thread_sum, offset);
+  for (int offset = WARP / 2; offset > 0; offset >>= 1) {
+    thread_sum += __shfl_down_sync(0xffffffffffffffffull, thread_sum, offset);
   }
-  __shared__ acc_t warp_sums[BLOCK / 32];
-  const int lane = threadIdx.x & 31;
-  const int warp_id = threadIdx.x >> 5;
+  __shared__ acc_t warp_sums[WARPS];
+  const int lane = threadIdx.x & (WARP - 1);
+  const int warp_id = threadIdx.x / WARP;
   if (lane == 0) warp_sums[warp_id] = thread_sum;
   __syncthreads();
   if (warp_id == 0) {
-    acc_t v =
-        (threadIdx.x < (BLOCK / 32)) ? warp_sums[threadIdx.x] : acc_t(0);
-    for (int offset = (BLOCK / 64); offset > 0; offset >>= 1) {
-      v += __shfl_down_sync(0xffffffffu, v, offset);
+    acc_t v = (threadIdx.x < WARPS) ? warp_sums[threadIdx.x] : acc_t(0);
+    for (int offset = WARPS / 2; offset > 0; offset >>= 1) {
+      v += __shfl_down_sync(0xffffffffffffffffull, v, offset);
     }
-    if (threadIdx.x == 0) {
+    if (threadIdx.x == 0 && valid) {
       partials[(outer_idx * inner + inner_idx) * splits + split_idx] = v;
     }
   }
@@ -391,10 +393,11 @@ void LaunchMeanAlongDim(
     const int64_t reduce_per_block = (reduce + splits - 1) / splits;
     const int64_t partial_bytes = total_slots * splits * sizeof(acc_t);
     acc_t* partials = AcquireWorkspace<acc_t>(partial_bytes);
+    // One block per (outer, inner, split) — grid Y = inner (=1 here, since
+    // the degenerate path requires inner<=1).
     const dim3 blocks(
         static_cast<unsigned int>(outer),
-        static_cast<unsigned int>(
-            (inner + static_cast<int64_t>(BLOCK) - 1) / BLOCK),
+        static_cast<unsigned int>(inner),
         static_cast<unsigned int>(splits));
     const dim3 threads(BLOCK, 1, 1);
     MeanAlongDimSplitKReduceKernelImpl<scalar_t, acc_t, out_t>
@@ -407,14 +410,16 @@ void LaunchMeanAlongDim(
               total_slots, splits, inv_reduce, out_ptr, partials);
     }
   } else if constexpr (arith) {
+    // BlockReduce launches one block per (outer, inner) slot. Guard against
+    // inner exceeding the grid-Y limit (65535); fall through to FlatKernel.
     const bool use_block_reduce =
         (inner <= 1) ||
-        (total_slots < static_cast<int64_t>(metax::kMaxGridV2 * BLOCK));
+        (inner <= metax::kMaxGridV2 &&
+         total_slots < static_cast<int64_t>(metax::kMaxGridV2 * BLOCK));
     if (use_block_reduce) {
       const dim3 blocks(
           static_cast<unsigned int>(outer),
-          static_cast<unsigned int>(
-              (inner + static_cast<int64_t>(BLOCK) - 1) / BLOCK),
+          static_cast<unsigned int>(inner),
           1);
       const dim3 threads(BLOCK, 1, 1);
       MeanAlongDimBlockReduceKernelImpl<scalar_t, acc_t, out_t>
