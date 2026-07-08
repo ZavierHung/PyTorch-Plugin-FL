@@ -342,6 +342,14 @@ from torch_fl.integration import (  # noqa: E402
     use_flaggems,
 )
 
+# Re-export optional fused RMSNorm patch (§2.2(b): single-kernel RMSNorm).
+# Auto-installs an import hook when FLAGOS_RMSNORM_FUSED=1.
+from torch_fl.optimizations import (  # noqa: E402
+    apply_fused_rmsnorm,
+    restore_rmsnorm,
+    is_rmsnorm_fused_active,
+)
+
 __all__ = [
     "flagos",
     "distributed",
@@ -350,4 +358,7 @@ __all__ = [
     "is_flaggems_available",
     "enable_flaggems_for_flagos",
     "use_flaggems",
+    "apply_fused_rmsnorm",
+    "restore_rmsnorm",
+    "is_rmsnorm_fused_active",
 ]

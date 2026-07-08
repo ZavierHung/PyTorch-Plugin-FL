@@ -21,6 +21,7 @@
 #include "mul.h"
 #include "rsqrt.h"
 #include "mean.h"
+#include "rmsnorm.h"
 #include "cos.h"
 #include "sin.h"
 #include "pow.h"
@@ -315,6 +316,11 @@ at::Tensor WrapperMeanDim(
     const at::Tensor& self, at::OptionalIntArrayRef dim,
     bool keepdim, std::optional<at::ScalarType> dtype) {
   return at::native::flagos::mean_dim_dispatcher(self, dim, keepdim, dtype);
+}
+
+at::Tensor WrapperRmsNorm(
+    const at::Tensor& input, const at::Tensor& weight, double eps) {
+  return at::native::flagos::RmsNormV2(input, weight, eps);
 }
 
 at::Tensor WrapperCos(const at::Tensor& self) {
@@ -689,6 +695,19 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("lt.Tensor", WrapperLtTensor);
   m.impl("lt.Scalar", WrapperLtScalar);
   m.impl("cumsum", WrapperCumsum);
+}
+
+// Fused RMSNorm custom op (flagos::rms_norm). Not an aten op — HF RMSNorm is a
+// hand-written pow/mean/rsqrt/mul chain, so it cannot be intercepted through
+// the dispatcher. torch_fl/optimizations.py patches HF *RMSNorm.forward to call
+// torch.ops.flagos.rms_norm when FLAGOS_RMSNORM_FUSED=1.
+// See docs/trace_optimization_plan_2026-07-06.md §2.2(b).
+TORCH_LIBRARY(flagos, m) {
+  m.def("rms_norm(Tensor input, Tensor weight, float eps) -> Tensor");
+}
+
+TORCH_LIBRARY_IMPL(flagos, PrivateUse1, m) {
+  m.impl("rms_norm", WrapperRmsNorm);
 }
 
 // Register fallback for all unimplemented operators
