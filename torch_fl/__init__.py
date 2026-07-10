@@ -344,10 +344,21 @@ from torch_fl.integration import (  # noqa: E402
 
 # Re-export optional fused RMSNorm patch (§2.2(b): single-kernel RMSNorm).
 # Auto-installs an import hook when FLAGOS_RMSNORM_FUSED=1.
+# Re-export optional fused RoPE patch (module-level apply_rotary_pos_emb).
+# Auto-installs an import hook when FLAGOS_ROPE_FUSED=1.
+# Re-export optional fused masked-softmax patch (module-level
+# eager_attention_forward). Auto-installs an import hook when
+# FLAGOS_SOFTMAX_FUSED=1.
 from torch_fl.optimizations import (  # noqa: E402
     apply_fused_rmsnorm,
     restore_rmsnorm,
     is_rmsnorm_fused_active,
+    apply_fused_rope,
+    restore_rope,
+    is_rope_fused_active,
+    apply_fused_softmax,
+    restore_softmax,
+    is_softmax_fused_active,
 )
 
 __all__ = [
@@ -361,4 +372,10 @@ __all__ = [
     "apply_fused_rmsnorm",
     "restore_rmsnorm",
     "is_rmsnorm_fused_active",
+    "apply_fused_rope",
+    "restore_rope",
+    "is_rope_fused_active",
+    "apply_fused_softmax",
+    "restore_softmax",
+    "is_softmax_fused_active",
 ]

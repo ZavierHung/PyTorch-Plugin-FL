@@ -22,6 +22,8 @@
 #include "rsqrt.h"
 #include "mean.h"
 #include "rmsnorm.h"
+#include "rope.h"
+#include "masked_softmax.h"
 #include "cos.h"
 #include "sin.h"
 #include "pow.h"
@@ -321,6 +323,22 @@ at::Tensor WrapperMeanDim(
 at::Tensor WrapperRmsNorm(
     const at::Tensor& input, const at::Tensor& weight, double eps) {
   return at::native::flagos::RmsNormV2(input, weight, eps);
+}
+
+std::tuple<at::Tensor, at::Tensor> WrapperRoPE(
+    const at::Tensor& q,
+    const at::Tensor& k,
+    const at::Tensor& cos,
+    const at::Tensor& sin,
+    int64_t unsqueeze_dim) {
+  return at::native::flagos::RoPEV2(q, k, cos, sin, unsqueeze_dim);
+}
+
+at::Tensor WrapperMaskedSoftmax(
+    const at::Tensor& attn_weights,
+    const c10::optional<at::Tensor>& mask,
+    double scaling) {
+  return at::native::flagos::MaskedSoftmaxV2(attn_weights, mask, scaling);
 }
 
 at::Tensor WrapperCos(const at::Tensor& self) {
@@ -704,10 +722,14 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
 // See docs/trace_optimization_plan_2026-07-06.md §2.2(b).
 TORCH_LIBRARY(flagos, m) {
   m.def("rms_norm(Tensor input, Tensor weight, float eps) -> Tensor");
+  m.def("rope(Tensor q, Tensor k, Tensor cos, Tensor sin, int unsqueeze_dim) -> (Tensor, Tensor)");
+  m.def("masked_softmax(Tensor attn_weights, Tensor? mask, float scaling) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(flagos, PrivateUse1, m) {
   m.impl("rms_norm", WrapperRmsNorm);
+  m.impl("rope", WrapperRoPE);
+  m.impl("masked_softmax", WrapperMaskedSoftmax);
 }
 
 // Register fallback for all unimplemented operators
