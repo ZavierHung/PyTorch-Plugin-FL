@@ -359,6 +359,12 @@ from torch_fl.optimizations import (  # noqa: E402
     apply_fused_softmax,
     restore_softmax,
     is_softmax_fused_active,
+    apply_fused_swiglu,
+    restore_swiglu,
+    is_swiglu_fused_active,
+    apply_fused_add_rmsnorm,
+    restore_add_rmsnorm,
+    is_add_rmsnorm_fused_active,
 )
 
 __all__ = [
@@ -378,4 +384,10 @@ __all__ = [
     "apply_fused_softmax",
     "restore_softmax",
     "is_softmax_fused_active",
+    "apply_fused_swiglu",
+    "restore_swiglu",
+    "is_swiglu_fused_active",
+    "apply_fused_add_rmsnorm",
+    "restore_add_rmsnorm",
+    "is_add_rmsnorm_fused_active",
 ]

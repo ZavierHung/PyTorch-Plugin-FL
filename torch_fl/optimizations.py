@@ -51,11 +51,21 @@ __all__ = [
     "restore_softmax",
     "is_softmax_fused_active",
     "FLAGOS_SOFTMAX_FUSED_ENV",
+    "apply_fused_swiglu",
+    "restore_swiglu",
+    "is_swiglu_fused_active",
+    "FLAGOS_SWIGLU_FUSED_ENV",
+    "apply_fused_add_rmsnorm",
+    "restore_add_rmsnorm",
+    "is_add_rmsnorm_fused_active",
+    "FLAGOS_ADD_RMSNORM_FUSED_ENV",
 ]
 
 FLAGOS_RMSNORM_FUSED_ENV = "FLAGOS_RMSNORM_FUSED"
 FLAGOS_ROPE_FUSED_ENV = "FLAGOS_ROPE_FUSED"
 FLAGOS_SOFTMAX_FUSED_ENV = "FLAGOS_SOFTMAX_FUSED"
+FLAGOS_SWIGLU_FUSED_ENV = "FLAGOS_SWIGLU_FUSED"
+FLAGOS_ADD_RMSNORM_FUSED_ENV = "FLAGOS_ADD_RMSNORM_FUSED"
 
 # (module path, class name) -> nothing. Order does not matter; the import hook
 # keys off the module path and patches every class listed for that module.
@@ -489,6 +499,10 @@ def _apply_all_fused_patches(module) -> None:
             _install_rope_on_module(module, mod_name)
         if os.environ.get(FLAGOS_SOFTMAX_FUSED_ENV, "0") == "1":
             _install_softmax_on_module(module, mod_name)
+        if os.environ.get(FLAGOS_SWIGLU_FUSED_ENV, "0") == "1":
+            _patch_swiglu_module(module)
+        if os.environ.get(FLAGOS_ADD_RMSNORM_FUSED_ENV, "0") == "1":
+            _patch_add_rmsnorm_module(module)
     except Exception:
         # Never let the patch break model import.
         pass
@@ -501,6 +515,275 @@ def _maybe_auto_install_softmax() -> None:
 
 
 # (install is deferred to the unified _maybe_auto_install() at the bottom.)
+
+
+# ===========================================================================
+# Fused SwiGLU (flagos::swiglu) — MLP class-method patch
+# ===========================================================================
+#
+# HuggingFace's gated MLP forward is::
+#
+#     down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+#
+# The ``self.act_fn(...) * self.up_proj(x)`` part is a silu launch followed by
+# an elementwise-mul launch (2 kernels). This patch replaces that sub-chain with
+# a single ``torch.ops.flagos.swiglu`` launch (silu in fp32, product cast back
+# to model dtype). The two matmuls stay as-is; only the activation+mul fuse.
+#
+# IMPORTANT: the fused kernel hard-codes silu, so only silu-gated families are
+# targeted (Qwen3/Qwen2/Llama/Mistral). Gemma (gelu) and Starcoder2 (no gate)
+# are intentionally excluded — patching them would be numerically wrong.
+
+# (module path, class name tuple). SwiGLU patches the MLP class' forward.
+_SWIGLU_TARGETS: Dict[str, Tuple[str, ...]] = {
+    "transformers.models.qwen3.modeling_qwen3": ("Qwen3MLP",),
+    "transformers.models.qwen2.modeling_qwen2": ("Qwen2MLP",),
+    "transformers.models.llama.modeling_llama": ("LlamaMLP",),
+    "transformers.models.mistral.modeling_mistral": ("MistralMLP",),
+}
+
+# cls qualified-name -> original forward. Reversible + idempotent.
+_SWIGLU_ORIG: Dict[str, object] = {}
+
+
+def _fused_mlp_forward(self, x):
+    """MLP forward that fuses silu(gate)*up into one ``flagos.swiglu`` launch.
+
+    Replaces HF's ``self.act_fn(self.gate_proj(x)) * self.up_proj(x)`` (a silu
+    launch + an elementwise-mul launch) with a single kernel. silu is computed
+    in fp32 internally — numerically equivalent to the HF fp16 path. Only valid
+    for silu-gated MLPs (see _SWIGLU_TARGETS).
+    """
+    return self.down_proj(torch.ops.flagos.swiglu(self.gate_proj(x), self.up_proj(x)))
+
+
+def _is_fused_mlp(fn: object) -> bool:
+    return getattr(fn, "__name__", None) == "_fused_mlp_forward"
+
+
+def _install_swiglu_on_class(cls: type, qualname: str) -> bool:
+    """Install the fused MLP forward on a single class. Returns True if newly
+    patched."""
+    if _is_fused_mlp(cls.__dict__.get("forward")):
+        return False
+    # Guard: only patch classes whose forward looks like the HF gated-MLP
+    # pattern (references act_fn / gate_proj / up_proj).
+    try:
+        import inspect
+
+        src = inspect.getsource(cls.forward)
+    except Exception:
+        src = ""
+    if "act_fn" not in src or "gate_proj" not in src or "up_proj" not in src:
+        return False
+    _SWIGLU_ORIG[qualname] = cls.forward
+    cls.forward = _fused_mlp_forward  # type: ignore[assignment]
+    return True
+
+
+def _patch_swiglu_module(mod: object) -> List[str]:
+    """Patch every target MLP class defined in *mod*."""
+    mod_name = getattr(mod, "__name__", "")
+    cls_names = _SWIGLU_TARGETS.get(mod_name)
+    if not cls_names:
+        return []
+    patched: List[str] = []
+    for cls_name in cls_names:
+        cls = getattr(mod, cls_name, None)
+        if cls is None or not isinstance(cls, type):
+            continue
+        qualname = f"{mod_name}.{cls_name}"
+        with _lock:
+            did = _install_swiglu_on_class(cls, qualname)
+        if did:
+            patched.append(qualname)
+    return patched
+
+
+def apply_fused_swiglu() -> List[str]:
+    """Patch every already-imported HF gated-MLP class to run silu(gate)*up as a
+    single ``torch.ops.flagos.swiglu`` launch. Idempotent. Returns the list of
+    qualified class names newly patched."""
+    patched: List[str] = []
+    for mod_name in _SWIGLU_TARGETS:
+        mod = sys.modules.get(mod_name)
+        if mod is None:
+            continue
+        patched.extend(_patch_swiglu_module(mod))
+    return patched
+
+
+def restore_swiglu() -> List[str]:
+    """Undo :func:`apply_fused_swiglu` / the import hook."""
+    restored: List[str] = []
+    with _lock:
+        for qualname, orig in list(_SWIGLU_ORIG.items()):
+            mod_name, _, cls_name = qualname.rpartition(".")
+            mod = sys.modules.get(mod_name)
+            cls = getattr(mod, cls_name, None) if mod is not None else None
+            if cls is not None and _is_fused_mlp(cls.__dict__.get("forward")):
+                cls.forward = orig  # type: ignore[assignment]
+                restored.append(qualname)
+        _SWIGLU_ORIG.clear()
+    return restored
+
+
+def is_swiglu_fused_active() -> bool:
+    """True if at least one gated-MLP class is currently patched with the fused
+    single-kernel forward."""
+    with _lock:
+        return bool(_SWIGLU_ORIG)
+
+
+# ===========================================================================
+# Fused residual-add + RMSNorm (flagos::add_rms_norm) — DecoderLayer patch
+# ===========================================================================
+#
+# The HF decoder layer's post-attention section is::
+#
+#     hidden_states = residual + hidden_states            # residual add
+#     residual = hidden_states
+#     hidden_states = self.post_attention_layernorm(hidden_states)  # RMSNorm
+#
+# That add (1 launch) + RMSNorm chain (5+ launches) fuse into a single
+# ``torch.ops.flagos.add_rms_norm`` launch returning (normed, new_residual).
+# Unlike the other fusions (which patch a single method/function), this patches
+# the WHOLE DecoderLayer.forward and rewrites the call sequence — the add and
+# the norm live at different call sites, so only a forward-level rewrite can
+# fuse them. The fused forward replicates HF's logic verbatim except for those
+# three lines. input_layernorm is left untouched (still fused via the RMSNorm
+# class patch when FLAGOS_RMSNORM_FUSED=1); the layer-final residual add is left
+# alone (its norm is the next layer's input_layernorm, across a forward
+# boundary). Source matched against transformers 5.6.2.
+
+# (module path, class name tuple). Patches the DecoderLayer class' forward.
+_DECODER_TARGETS: Dict[str, Tuple[str, ...]] = {
+    "transformers.models.qwen3.modeling_qwen3": ("Qwen3DecoderLayer",),
+    "transformers.models.qwen2.modeling_qwen2": ("Qwen2DecoderLayer",),
+    "transformers.models.llama.modeling_llama": ("LlamaDecoderLayer",),
+    "transformers.models.mistral.modeling_mistral": ("MistralDecoderLayer",),
+}
+
+_DECODER_ORIG: Dict[str, object] = {}
+
+
+def _fused_decoder_layer_forward(
+    self,
+    hidden_states,
+    attention_mask=None,
+    position_ids=None,
+    past_key_values=None,
+    use_cache=False,
+    position_embeddings=None,
+    **kwargs,
+):
+    """DecoderLayer forward that fuses the post-attention ``residual + attn_out``
+    and ``post_attention_layernorm`` into one ``flagos.add_rms_norm`` launch.
+
+    Replicates HF Qwen3DecoderLayer.forward (transformers 5.6.2) verbatim except
+    the post-attention add+norm, which becomes a single kernel returning
+    (normed, new_residual). Returns the bare hidden_states tensor (matching HF).
+    """
+    residual = hidden_states
+    hidden_states = self.input_layernorm(hidden_states)
+    hidden_states, _ = self.self_attn(
+        hidden_states=hidden_states,
+        attention_mask=attention_mask,
+        position_ids=position_ids,
+        past_key_values=past_key_values,
+        use_cache=use_cache,
+        position_embeddings=position_embeddings,
+        **kwargs,
+    )
+    # Fused: new_residual = residual + hidden_states (fp16);
+    #        hidden_states = post_attention_layernorm(new_residual)
+    hidden_states, residual = torch.ops.flagos.add_rms_norm(
+        residual,
+        hidden_states,
+        self.post_attention_layernorm.weight,
+        self.post_attention_layernorm.variance_epsilon,
+    )
+    hidden_states = self.mlp(hidden_states)
+    hidden_states = residual + hidden_states
+    return hidden_states
+
+
+def _is_fused_decoder(fn: object) -> bool:
+    return getattr(fn, "__name__", None) == "_fused_decoder_layer_forward"
+
+
+def _install_add_rmsnorm_on_class(cls: type, qualname: str) -> bool:
+    """Install the fused DecoderLayer forward on a single class. Returns True if
+    newly patched."""
+    if _is_fused_decoder(cls.__dict__.get("forward")):
+        return False
+    # Guard: only patch classes whose forward looks like the standard HF decoder
+    # layer (references post_attention_layernorm + residual).
+    try:
+        import inspect
+
+        src = inspect.getsource(cls.forward)
+    except Exception:
+        src = ""
+    if "post_attention_layernorm" not in src or "residual" not in src:
+        return False
+    _DECODER_ORIG[qualname] = cls.forward
+    cls.forward = _fused_decoder_layer_forward  # type: ignore[assignment]
+    return True
+
+
+def _patch_add_rmsnorm_module(mod: object) -> List[str]:
+    """Patch every target DecoderLayer class defined in *mod*."""
+    mod_name = getattr(mod, "__name__", "")
+    cls_names = _DECODER_TARGETS.get(mod_name)
+    if not cls_names:
+        return []
+    patched: List[str] = []
+    for cls_name in cls_names:
+        cls = getattr(mod, cls_name, None)
+        if cls is None or not isinstance(cls, type):
+            continue
+        qualname = f"{mod_name}.{cls_name}"
+        with _lock:
+            did = _install_add_rmsnorm_on_class(cls, qualname)
+        if did:
+            patched.append(qualname)
+    return patched
+
+
+def apply_fused_add_rmsnorm() -> List[str]:
+    """Patch every already-imported HF DecoderLayer class to fuse the
+    post-attention residual-add + RMSNorm into one ``torch.ops.flagos.add_rms_norm``
+    launch. Idempotent. Returns the list of qualified class names newly patched."""
+    patched: List[str] = []
+    for mod_name in _DECODER_TARGETS:
+        mod = sys.modules.get(mod_name)
+        if mod is None:
+            continue
+        patched.extend(_patch_add_rmsnorm_module(mod))
+    return patched
+
+
+def restore_add_rmsnorm() -> List[str]:
+    """Undo :func:`apply_fused_add_rmsnorm` / the import hook."""
+    restored: List[str] = []
+    with _lock:
+        for qualname, orig in list(_DECODER_ORIG.items()):
+            mod_name, _, cls_name = qualname.rpartition(".")
+            mod = sys.modules.get(mod_name)
+            cls = getattr(mod, cls_name, None) if mod is not None else None
+            if cls is not None and _is_fused_decoder(cls.__dict__.get("forward")):
+                cls.forward = orig  # type: ignore[assignment]
+                restored.append(qualname)
+        _DECODER_ORIG.clear()
+    return restored
+
+
+def is_add_rmsnorm_fused_active() -> bool:
+    """True if at least one DecoderLayer class is currently patched with the
+    fused residual-add + RMSNorm forward."""
+    with _lock:
+        return bool(_DECODER_ORIG)
 
 
 # ===========================================================================
@@ -518,7 +801,11 @@ def _maybe_auto_install_softmax() -> None:
 # Union of every modelling module that any fusion targets (they all target the
 # same set of HF modelling modules, but take the union defensively).
 _ALL_FUSION_TARGETS = frozenset(
-    list(_TARGETS.keys()) + list(_ROPE_TARGETS.keys()) + list(_SOFTMAX_TARGETS.keys())
+    list(_TARGETS.keys())
+    + list(_ROPE_TARGETS.keys())
+    + list(_SOFTMAX_TARGETS.keys())
+    + list(_SWIGLU_TARGETS.keys())
+    + list(_DECODER_TARGETS.keys())
 )
 
 _FUSION_HOOK_INSTALLED = False
@@ -606,12 +893,16 @@ def _maybe_auto_install() -> None:
         os.environ.get(FLAGOS_RMSNORM_FUSED_ENV, "0") == "1"
         or os.environ.get(FLAGOS_ROPE_FUSED_ENV, "0") == "1"
         or os.environ.get(FLAGOS_SOFTMAX_FUSED_ENV, "0") == "1"
+        or os.environ.get(FLAGOS_SWIGLU_FUSED_ENV, "0") == "1"
+        or os.environ.get(FLAGOS_ADD_RMSNORM_FUSED_ENV, "0") == "1"
     )
     if _any_on:
         _install_fusion_import_hook()
         apply_fused_rmsnorm()
         apply_fused_rope()
         apply_fused_softmax()
+        apply_fused_swiglu()
+        apply_fused_add_rmsnorm()
 
 
 _maybe_auto_install()

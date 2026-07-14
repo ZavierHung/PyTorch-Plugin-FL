@@ -24,6 +24,8 @@
 #include "rmsnorm.h"
 #include "rope.h"
 #include "masked_softmax.h"
+#include "swiglu.h"
+#include "add_rms_norm.h"
 #include "cos.h"
 #include "sin.h"
 #include "pow.h"
@@ -339,6 +341,18 @@ at::Tensor WrapperMaskedSoftmax(
     const c10::optional<at::Tensor>& mask,
     double scaling) {
   return at::native::flagos::MaskedSoftmaxV2(attn_weights, mask, scaling);
+}
+
+at::Tensor WrapperSwiGLU(const at::Tensor& gate, const at::Tensor& up) {
+  return at::native::flagos::SwiGLUV2(gate, up);
+}
+
+std::tuple<at::Tensor, at::Tensor> WrapperAddRmsNorm(
+    const at::Tensor& residual,
+    const at::Tensor& hidden,
+    const at::Tensor& weight,
+    double eps) {
+  return at::native::flagos::AddRmsNormV2(residual, hidden, weight, eps);
 }
 
 at::Tensor WrapperCos(const at::Tensor& self) {
@@ -724,12 +738,16 @@ TORCH_LIBRARY(flagos, m) {
   m.def("rms_norm(Tensor input, Tensor weight, float eps) -> Tensor");
   m.def("rope(Tensor q, Tensor k, Tensor cos, Tensor sin, int unsqueeze_dim) -> (Tensor, Tensor)");
   m.def("masked_softmax(Tensor attn_weights, Tensor? mask, float scaling) -> Tensor");
+  m.def("swiglu(Tensor gate, Tensor up) -> Tensor");
+  m.def("add_rms_norm(Tensor residual, Tensor hidden, Tensor weight, float eps) -> (Tensor, Tensor)");
 }
 
 TORCH_LIBRARY_IMPL(flagos, PrivateUse1, m) {
   m.impl("rms_norm", WrapperRmsNorm);
   m.impl("rope", WrapperRoPE);
   m.impl("masked_softmax", WrapperMaskedSoftmax);
+  m.impl("swiglu", WrapperSwiGLU);
+  m.impl("add_rms_norm", WrapperAddRmsNorm);
 }
 
 // Register fallback for all unimplemented operators
