@@ -10,6 +10,11 @@
 // launches) into 1~2. I/O keeps the model dtype; cos/sin are promoted to fp32
 // (opmath_type) and all muls/adds run in fp32, matching HF's fp32 semantics.
 // Pure elementwise (no reduction), so warpSize is irrelevant.
+//
+// cos/sin are passed compact [batch,1,seq,d] (NOT broadcast to heads); the
+// head dim is broadcast logically inside the kernel by deriving (batch,seq)
+// from the q row index. This drops the 4 expand+contiguous materializations
+// per layer that used to dominate flagos::rope's CPU time.
 
 #pragma once
 
@@ -33,13 +38,16 @@ namespace {
 // grid-stride over pairs: each thread handles one (i, i+half) pair.
 // n_pairs = half * rows, rows = numel / d, half = d/2 (d must be even).
 //
-// cos/sin are host-broadcast to q's shape (unsqueeze then expand+contiguous to
-// [batch,heads,seq,d]), so cos/sin share q's linear index in the kernel.
+// cos/sin come in compact [batch,1,seq,d]; the head dim is broadcast by
+// mapping the q row -> (batch, seq): for q laid out [batch,heads,seq,d]
+// row-major, cos_row = batch*seq + seq_idx (head-independent).
 
 template <typename scalar_t, typename acc_t, typename cos_t>
 __global__ void RoPEKernel(
     int64_t n_pairs,           // = half * rows
     int64_t half,              // d / 2
+    int64_t seq,               // seq_len (for cos/sin row mapping)
+    int64_t heads_times_seq,   // heads*seq (to recover batch)
     scalar_t* __restrict__ out,
     const scalar_t* __restrict__ x,
     const cos_t* __restrict__ cos,
@@ -57,17 +65,24 @@ __global__ void RoPEKernel(
     const int64_t i_lo = base + j;          // front half
     const int64_t i_hi = base + half + j;   // back half
 
+    // cos/sin row: head-dim logical broadcast (cos is [batch,1,seq,d] compact)
+    const int64_t b = row / heads_times_seq;
+    const int64_t s = row % seq;
+    const int64_t cbase = (b * seq + s) * (half * 2);
+    const int64_t c_lo = cbase + j;
+    const int64_t c_hi = cbase + half + j;
+
     // read and promote to fp32
     const acc_t x_lo = static_cast<acc_t>(__ldg(x + i_lo));
     const acc_t x_hi = static_cast<acc_t>(__ldg(x + i_hi));
-    const acc_t c_lo = static_cast<acc_t>(__ldg(cos + i_lo));
-    const acc_t c_hi = static_cast<acc_t>(__ldg(cos + i_hi));
-    const acc_t s_lo = static_cast<acc_t>(__ldg(sin + i_lo));
-    const acc_t s_hi = static_cast<acc_t>(__ldg(sin + i_hi));
+    const acc_t c_lo_v = static_cast<acc_t>(__ldg(cos + c_lo));
+    const acc_t c_hi_v = static_cast<acc_t>(__ldg(cos + c_hi));
+    const acc_t s_lo_v = static_cast<acc_t>(__ldg(sin + c_lo));
+    const acc_t s_hi_v = static_cast<acc_t>(__ldg(sin + c_hi));
 
     // RoPE (rotate_half equivalent)
-    out[i_lo] = static_cast<scalar_t>(x_lo * c_lo - x_hi * s_lo);
-    out[i_hi] = static_cast<scalar_t>(x_hi * c_hi + x_lo * s_hi);
+    out[i_lo] = static_cast<scalar_t>(x_lo * c_lo_v - x_hi * s_lo_v);
+    out[i_hi] = static_cast<scalar_t>(x_hi * c_hi_v + x_lo * s_hi_v);
   }
 }
 
@@ -79,6 +94,8 @@ template <typename scalar_t, typename acc_t, typename cos_t>
 void LaunchRoPE(
     int64_t rows,
     int64_t half,
+    int64_t seq,
+    int64_t heads_times_seq,
     scalar_t* out_ptr,
     const scalar_t* x_ptr,
     const cos_t* cos_ptr,
@@ -94,7 +111,8 @@ void LaunchRoPE(
   }
   RoPEKernel<scalar_t, acc_t, cos_t>
       <<<blocks, metax::kBlockSizeV2, 0, stream>>>(
-          n_pairs, half, out_ptr, x_ptr, cos_ptr, sin_ptr);
+          n_pairs, half, seq, heads_times_seq,
+          out_ptr, x_ptr, cos_ptr, sin_ptr);
   const cudaError_t err = cudaGetLastError();
   TORCH_CHECK(
       err == cudaSuccess,
@@ -105,7 +123,8 @@ void LaunchRoPE(
 // ============================================================================
 // Host helper: apply RoPE to one tensor
 // ============================================================================
-// Broadcasts cos/sin to x's shape, dispatches by dtype, launches the kernel.
+// cos/sin come in compact ([batch,1,seq,d], not broadcast to heads); the head
+// dim is broadcast inside the kernel, avoiding expand+contiguous.
 
 template <typename scalar_t, typename acc_t>
 at::Tensor ApplyRoPEOne(
@@ -114,24 +133,30 @@ at::Tensor ApplyRoPEOne(
     const at::Tensor& sin_in) {
   using cos_t = acc_t;  // treat cos/sin as fp32 (acc_t = float for fp16/bf16)
 
-  const int64_t d = x.size(x.dim() - 1);
+  const int64_t nd = x.dim();
+  const int64_t d = x.size(nd - 1);
   TORCH_CHECK(d % 2 == 0, "rope: last dim must be even, got ", d);
   const int64_t half = d / 2;
   const int64_t rows = x.numel() / d;
+  // x layout [batch, heads, seq, d]: seq = dim-2, heads = dim-3 (else 1).
+  const int64_t seq = x.size(nd - 2);
+  const int64_t heads = nd >= 3 ? x.size(nd - 3) : 1;
+  const int64_t heads_times_seq = heads * seq;
 
-  // cos/sin must be broadcast to x's full shape and contiguous for linear
-  // indexing.
-  at::Tensor cos_b = BroadcastContiguousIfNeeded(cos_in, x.sizes());
-  at::Tensor sin_b = BroadcastContiguousIfNeeded(sin_in, x.sizes());
+  // cos/sin only need to be contiguous ([batch,1,seq,d] already is); no expand
+  // to [batch,heads,seq,d]. The kernel indexes by (batch,seq) and broadcasts.
+  at::Tensor cos_c = cos_in.is_contiguous() ? cos_in : cos_in.contiguous();
+  at::Tensor sin_c = sin_in.is_contiguous() ? sin_in : sin_in.contiguous();
 
   // cos/sin dtype may differ from x (commonly cos=fp32, x=fp16). Cast to acc_t
-  // if needed (no-op if already acc_t).
+  // if needed; this acts on the compact [batch,1,seq,d] so the cost is
+  // negligible. No-op if already acc_t.
   constexpr at::ScalarType kAccScalar = c10::CppTypeToScalarType<cos_t>::value;
-  if (cos_b.scalar_type() != kAccScalar) {
-    cos_b = cos_b.to(kAccScalar);
+  if (cos_c.scalar_type() != kAccScalar) {
+    cos_c = cos_c.to(kAccScalar);
   }
-  if (sin_b.scalar_type() != kAccScalar) {
-    sin_b = sin_b.to(kAccScalar);
+  if (sin_c.scalar_type() != kAccScalar) {
+    sin_c = sin_c.to(kAccScalar);
   }
 
   at::Tensor out = at::empty_like(x);
@@ -142,10 +167,12 @@ at::Tensor ApplyRoPEOne(
   LaunchRoPE<scalar_t, acc_t, cos_t>(
       rows,
       half,
+      seq,
+      heads_times_seq,
       out.data_ptr<scalar_t>(),
       x.data_ptr<scalar_t>(),
-      cos_b.data_ptr<cos_t>(),
-      sin_b.data_ptr<cos_t>(),
+      cos_c.data_ptr<cos_t>(),
+      sin_c.data_ptr<cos_t>(),
       metax::CurrentStream());
 
   return out;
@@ -170,8 +197,9 @@ inline std::tuple<at::Tensor, at::Tensor> RoPEKernelV2(
       "rope: q and k must share dtype");
 
   // cos/sin: HF shape is typically [batch, seq, d]; unsqueeze(unsqueeze_dim)
-  // gives [batch, 1, seq, d]. Broadcast to q/k's full [batch,heads,seq,d] in
-  // the kernel path.
+  // gives [batch, 1, seq, d]. Kept compact (not expanded to heads) — the head
+  // dim is broadcast in the kernel. [batch,1,seq,d] is contiguous, so its
+  // data_ptr order matches the kernel's cos_row = batch*seq + seq_idx.
   at::Tensor cos_u = cos.unsqueeze(unsqueeze_dim);
   at::Tensor sin_u = sin.unsqueeze(unsqueeze_dim);
 

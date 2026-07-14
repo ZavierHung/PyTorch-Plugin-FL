@@ -365,6 +365,12 @@ from torch_fl.optimizations import (  # noqa: E402
     apply_fused_add_rmsnorm,
     restore_add_rmsnorm,
     is_add_rmsnorm_fused_active,
+    apply_fused_qkv,
+    restore_qkv,
+    is_qkv_fused_active,
+    apply_fused_gate_up,
+    restore_gate_up,
+    is_gate_up_fused_active,
 )
 
 __all__ = [
@@ -390,4 +396,10 @@ __all__ = [
     "apply_fused_add_rmsnorm",
     "restore_add_rmsnorm",
     "is_add_rmsnorm_fused_active",
+    "apply_fused_qkv",
+    "restore_qkv",
+    "is_qkv_fused_active",
+    "apply_fused_gate_up",
+    "restore_gate_up",
+    "is_gate_up_fused_active",
 ]

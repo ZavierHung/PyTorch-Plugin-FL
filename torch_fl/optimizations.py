@@ -59,6 +59,14 @@ __all__ = [
     "restore_add_rmsnorm",
     "is_add_rmsnorm_fused_active",
     "FLAGOS_ADD_RMSNORM_FUSED_ENV",
+    "apply_fused_qkv",
+    "restore_qkv",
+    "is_qkv_fused_active",
+    "FLAGOS_QKV_FUSED_ENV",
+    "apply_fused_gate_up",
+    "restore_gate_up",
+    "is_gate_up_fused_active",
+    "FLAGOS_GATEUP_FUSED_ENV",
 ]
 
 FLAGOS_RMSNORM_FUSED_ENV = "FLAGOS_RMSNORM_FUSED"
@@ -66,6 +74,8 @@ FLAGOS_ROPE_FUSED_ENV = "FLAGOS_ROPE_FUSED"
 FLAGOS_SOFTMAX_FUSED_ENV = "FLAGOS_SOFTMAX_FUSED"
 FLAGOS_SWIGLU_FUSED_ENV = "FLAGOS_SWIGLU_FUSED"
 FLAGOS_ADD_RMSNORM_FUSED_ENV = "FLAGOS_ADD_RMSNORM_FUSED"
+FLAGOS_QKV_FUSED_ENV = "FLAGOS_QKV_FUSED"
+FLAGOS_GATEUP_FUSED_ENV = "FLAGOS_GATEUP_FUSED"
 
 # (module path, class name) -> nothing. Order does not matter; the import hook
 # keys off the module path and patches every class listed for that module.
@@ -503,6 +513,10 @@ def _apply_all_fused_patches(module) -> None:
             _patch_swiglu_module(module)
         if os.environ.get(FLAGOS_ADD_RMSNORM_FUSED_ENV, "0") == "1":
             _patch_add_rmsnorm_module(module)
+        if os.environ.get(FLAGOS_QKV_FUSED_ENV, "0") == "1":
+            _patch_qkv_module(module)
+        if os.environ.get(FLAGOS_GATEUP_FUSED_ENV, "0") == "1":
+            _patch_gate_up_module(module)
     except Exception:
         # Never let the patch break model import.
         pass
@@ -787,6 +801,350 @@ def is_add_rmsnorm_fused_active() -> bool:
 
 
 # ===========================================================================
+# Fused QKV projection (weight-concat + single GEMM + split) — Attention patch
+# ===========================================================================
+#
+# HF attention computes q/k/v with three separate Linear (GEMM) launches, all
+# consuming the SAME hidden_states and differing only in output dim:
+#
+#     query_states = q_norm(q_proj(hidden).view(...)).transpose(1, 2)
+#     key_states   = k_norm(k_proj(hidden).view(...)).transpose(1, 2)
+#     value_states =        v_proj(hidden).view(...) .transpose(1, 2)
+#
+# On the launch-overhead-bound backend, three GEMM launches per layer per token
+# is three dispatch round-trips. Because the three weights share the input, they
+# can be concatenated along out-dim into ONE [hidden, q_out+k_out+v_out] weight,
+# run as a single F.linear, then split back — 3 launches → 1. The concat is done
+# ONCE (cached on the module as ``_fused_qkv_weight``) so decode steps only pay
+# the single GEMM. q_norm/k_norm are applied to the split slices exactly as HF
+# does, so the result is numerically identical (same weights, same math order).
+#
+# Only bias-free q/k/v projections are handled (Qwen3/Qwen2/Llama/Mistral are
+# all bias-free here); a bias would need concatenation too — guarded out.
+
+_QKV_TARGETS: Dict[str, Tuple[str, ...]] = {
+    "transformers.models.qwen3.modeling_qwen3": ("Qwen3Attention",),
+    "transformers.models.qwen2.modeling_qwen2": ("Qwen2Attention",),
+    "transformers.models.llama.modeling_llama": ("LlamaAttention",),
+    "transformers.models.mistral.modeling_mistral": ("MistralAttention",),
+}
+
+_QKV_ORIG: Dict[str, object] = {}
+
+
+def _get_fused_qkv_weight(self):
+    """Return (and lazily build+cache) the concatenated qkv weight for *self*.
+
+    Returns None if the module's q/k/v projections have a bias or otherwise
+    don't fit the simple concat (in which case the caller falls back to HF).
+    """
+    w = getattr(self, "_fused_qkv_weight", None)
+    if w is not None:
+        return w
+    q, k, v = self.q_proj, self.k_proj, self.v_proj
+    if q.bias is not None or k.bias is not None or v.bias is not None:
+        return None
+    with torch.no_grad():
+        w = torch.cat([q.weight, k.weight, v.weight], dim=0)
+    # Cache split sizes too (GQA: k/v out-dim < q out-dim).
+    self._fused_qkv_weight = w
+    self._fused_qkv_splits = (
+        q.weight.shape[0],
+        k.weight.shape[0],
+        v.weight.shape[0],
+    )
+    return w
+
+
+def _make_fused_qkv_attention_forward(orig_forward):
+    """Build a patched Attention.forward that fuses q/k/v proj into one GEMM.
+
+    Rewrites only the three projection GEMMs into a single concatenated GEMM +
+    split; everything after (q_norm/k_norm, rope, cache update, attention) is
+    delegated to HF by reconstructing the exact same intermediate tensors. To
+    stay robust across transformers versions, we don't re-implement the whole
+    forward — instead we temporarily swap q_proj/k_proj/v_proj for cheap slicing
+    Linears backed by the fused GEMM output. But that's fragile; simpler and
+    safe: replicate the projection lines and then call the ORIGINAL forward with
+    projections monkey-swapped is also fragile. We therefore inline the minimal
+    HF forward for the silu-gated families (matched against transformers 5.6.2).
+    """
+
+    def _fused_qkv_forward(
+        self,
+        hidden_states,
+        position_embeddings,
+        attention_mask=None,
+        past_key_values=None,
+        **kwargs,
+    ):
+        w = _get_fused_qkv_weight(self)
+        if w is None:
+            return orig_forward(
+                self,
+                hidden_states,
+                position_embeddings,
+                attention_mask,
+                past_key_values=past_key_values,
+                **kwargs,
+            )
+        input_shape = hidden_states.shape[:-1]
+        hidden_shape = (*input_shape, -1, self.head_dim)
+
+        # Single fused GEMM, then split into q/k/v along the last (out) dim.
+        qkv = torch.nn.functional.linear(hidden_states, w)
+        q_out, k_out, v_out = qkv.split(self._fused_qkv_splits, dim=-1)
+
+        query_states = self.q_norm(q_out.view(hidden_shape)).transpose(1, 2)
+        key_states = self.k_norm(k_out.view(hidden_shape)).transpose(1, 2)
+        value_states = v_out.view(hidden_shape).transpose(1, 2)
+
+        cos, sin = position_embeddings
+        query_states, key_states = _qkv_apply_rope(
+            self, query_states, key_states, cos, sin
+        )
+
+        if past_key_values is not None:
+            key_states, value_states = past_key_values.update(
+                key_states, value_states, self.layer_idx
+            )
+
+        from transformers.models.qwen3 import modeling_qwen3 as _mq3
+        from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+
+        attention_interface = ALL_ATTENTION_FUNCTIONS.get_interface(
+            self.config._attn_implementation, _mq3.eager_attention_forward
+        )
+        attn_output, attn_weights = attention_interface(
+            self,
+            query_states,
+            key_states,
+            value_states,
+            attention_mask,
+            dropout=0.0 if not self.training else self.attention_dropout,
+            scaling=self.scaling,
+            sliding_window=getattr(self, "sliding_window", None),
+            **kwargs,
+        )
+        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+        attn_output = self.o_proj(attn_output)
+        return attn_output, attn_weights
+
+    return _fused_qkv_forward
+
+
+def _qkv_apply_rope(self, q, k, cos, sin):
+    """Call whichever apply_rotary_pos_emb is live on the attention's module
+    (picks up the fused RoPE patch automatically)."""
+    import sys as _sys
+
+    mod = _sys.modules.get(type(self).__module__)
+    fn = getattr(mod, "apply_rotary_pos_emb", None)
+    return fn(q, k, cos, sin)
+
+
+def _is_fused_qkv(fn: object) -> bool:
+    return getattr(fn, "__name__", None) == "_fused_qkv_forward"
+
+
+def _install_qkv_on_class(cls: type, qualname: str) -> bool:
+    """Install the fused-QKV forward on a single Attention class."""
+    if _is_fused_qkv(cls.__dict__.get("forward")):
+        return False
+    try:
+        import inspect
+
+        src = inspect.getsource(cls.forward)
+    except Exception:
+        src = ""
+    # Guard: only patch the standard HF attention (q_proj/k_proj/v_proj +
+    # q_norm/k_norm + apply_rotary_pos_emb). q_norm/k_norm restricts this to the
+    # Qwen3 family, which is what we validate against.
+    if "q_proj" not in src or "k_proj" not in src or "v_proj" not in src:
+        return False
+    if "q_norm" not in src or "apply_rotary_pos_emb" not in src:
+        return False
+    _QKV_ORIG[qualname] = cls.forward
+    cls.forward = _make_fused_qkv_attention_forward(cls.forward)
+    return True
+
+
+def _patch_qkv_module(mod: object) -> List[str]:
+    mod_name = getattr(mod, "__name__", "")
+    cls_names = _QKV_TARGETS.get(mod_name)
+    if not cls_names:
+        return []
+    patched: List[str] = []
+    for cls_name in cls_names:
+        cls = getattr(mod, cls_name, None)
+        if cls is None or not isinstance(cls, type):
+            continue
+        qualname = f"{mod_name}.{cls_name}"
+        with _lock:
+            did = _install_qkv_on_class(cls, qualname)
+        if did:
+            patched.append(qualname)
+    return patched
+
+
+def apply_fused_qkv() -> List[str]:
+    """Patch every already-imported HF Attention class to fuse q/k/v projection
+    into a single concatenated GEMM. Idempotent. Returns newly-patched names."""
+    patched: List[str] = []
+    for mod_name in _QKV_TARGETS:
+        mod = sys.modules.get(mod_name)
+        if mod is None:
+            continue
+        patched.extend(_patch_qkv_module(mod))
+    return patched
+
+
+def restore_qkv() -> List[str]:
+    """Undo :func:`apply_fused_qkv`."""
+    restored: List[str] = []
+    with _lock:
+        for qualname, orig in list(_QKV_ORIG.items()):
+            mod_name, _, cls_name = qualname.rpartition(".")
+            mod = sys.modules.get(mod_name)
+            cls = getattr(mod, cls_name, None) if mod is not None else None
+            if cls is not None and _is_fused_qkv(cls.__dict__.get("forward")):
+                cls.forward = orig  # type: ignore[assignment]
+                restored.append(qualname)
+        _QKV_ORIG.clear()
+    return restored
+
+
+def is_qkv_fused_active() -> bool:
+    """True if at least one Attention class is patched with fused QKV."""
+    with _lock:
+        return bool(_QKV_ORIG)
+
+
+# ===========================================================================
+# Fused gate_up projection (weight-concat + single GEMM + split) — MLP patch
+# ===========================================================================
+#
+# HF gated MLP runs gate_proj and up_proj as two separate GEMMs on the same
+# input x. Like QKV, they share the input and differ only in being two halves,
+# so they concat into ONE [hidden, 2*intermediate] weight → single GEMM, split,
+# then feed the existing fused SwiGLU. 2 GEMM launches → 1. The concat is cached
+# on the module (``_fused_gate_up_weight``). This patch also folds in the SwiGLU
+# fusion (silu(gate)*up as one flagos.swiglu launch), so it supersedes the plain
+# SwiGLU patch when both are enabled — enabling gate_up alone already gets both
+# the merged GEMM and the fused activation. silu-gated families only.
+
+_GATEUP_TARGETS: Dict[str, Tuple[str, ...]] = {
+    "transformers.models.qwen3.modeling_qwen3": ("Qwen3MLP",),
+    "transformers.models.qwen2.modeling_qwen2": ("Qwen2MLP",),
+    "transformers.models.llama.modeling_llama": ("LlamaMLP",),
+    "transformers.models.mistral.modeling_mistral": ("MistralMLP",),
+}
+
+_GATEUP_ORIG: Dict[str, object] = {}
+
+
+def _get_fused_gate_up_weight(self):
+    """Lazily build+cache the concatenated [gate; up] weight. None if biased."""
+    w = getattr(self, "_fused_gate_up_weight", None)
+    if w is not None:
+        return w
+    g, u = self.gate_proj, self.up_proj
+    if g.bias is not None or u.bias is not None:
+        return None
+    with torch.no_grad():
+        w = torch.cat([g.weight, u.weight], dim=0)
+    self._fused_gate_up_weight = w
+    self._fused_gate_up_splits = (g.weight.shape[0], u.weight.shape[0])
+    return w
+
+
+def _fused_gate_up_mlp_forward(self, x):
+    """MLP forward fusing gate/up into one GEMM + fused SwiGLU activation.
+
+    ``[gate;up]`` GEMM in one launch, split, then ``flagos.swiglu`` (silu(gate)*up
+    in one launch). Falls back to HF if the projections are biased. Numerically
+    equivalent to HF: same weights, silu in fp32 (matching the SwiGLU kernel).
+    """
+    w = _get_fused_gate_up_weight(self)
+    if w is None:
+        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+    gate_up = torch.nn.functional.linear(x, w)
+    gate, up = gate_up.split(self._fused_gate_up_splits, dim=-1)
+    return self.down_proj(torch.ops.flagos.swiglu(gate, up))
+
+
+def _is_fused_gate_up(fn: object) -> bool:
+    return getattr(fn, "__name__", None) == "_fused_gate_up_mlp_forward"
+
+
+def _install_gate_up_on_class(cls: type, qualname: str) -> bool:
+    if _is_fused_gate_up(cls.__dict__.get("forward")):
+        return False
+    try:
+        import inspect
+
+        src = inspect.getsource(cls.forward)
+    except Exception:
+        src = ""
+    if "act_fn" not in src or "gate_proj" not in src or "up_proj" not in src:
+        return False
+    _GATEUP_ORIG[qualname] = cls.forward
+    cls.forward = _fused_gate_up_mlp_forward  # type: ignore[assignment]
+    return True
+
+
+def _patch_gate_up_module(mod: object) -> List[str]:
+    mod_name = getattr(mod, "__name__", "")
+    cls_names = _GATEUP_TARGETS.get(mod_name)
+    if not cls_names:
+        return []
+    patched: List[str] = []
+    for cls_name in cls_names:
+        cls = getattr(mod, cls_name, None)
+        if cls is None or not isinstance(cls, type):
+            continue
+        qualname = f"{mod_name}.{cls_name}"
+        with _lock:
+            did = _install_gate_up_on_class(cls, qualname)
+        if did:
+            patched.append(qualname)
+    return patched
+
+
+def apply_fused_gate_up() -> List[str]:
+    """Patch every already-imported HF gated-MLP class to fuse gate/up into one
+    GEMM + fused SwiGLU. Idempotent. Returns newly-patched names."""
+    patched: List[str] = []
+    for mod_name in _GATEUP_TARGETS:
+        mod = sys.modules.get(mod_name)
+        if mod is None:
+            continue
+        patched.extend(_patch_gate_up_module(mod))
+    return patched
+
+
+def restore_gate_up() -> List[str]:
+    """Undo :func:`apply_fused_gate_up`."""
+    restored: List[str] = []
+    with _lock:
+        for qualname, orig in list(_GATEUP_ORIG.items()):
+            mod_name, _, cls_name = qualname.rpartition(".")
+            mod = sys.modules.get(mod_name)
+            cls = getattr(mod, cls_name, None) if mod is not None else None
+            if cls is not None and _is_fused_gate_up(cls.__dict__.get("forward")):
+                cls.forward = orig  # type: ignore[assignment]
+                restored.append(qualname)
+        _GATEUP_ORIG.clear()
+    return restored
+
+
+def is_gate_up_fused_active() -> bool:
+    """True if at least one gated-MLP class is patched with fused gate_up."""
+    with _lock:
+        return bool(_GATEUP_ORIG)
+
+
+# ===========================================================================
 # Single unified import hook for ALL fused patches (RMSNorm / RoPE / softmax)
 # ===========================================================================
 #
@@ -806,6 +1164,8 @@ _ALL_FUSION_TARGETS = frozenset(
     + list(_SOFTMAX_TARGETS.keys())
     + list(_SWIGLU_TARGETS.keys())
     + list(_DECODER_TARGETS.keys())
+    + list(_QKV_TARGETS.keys())
+    + list(_GATEUP_TARGETS.keys())
 )
 
 _FUSION_HOOK_INSTALLED = False
@@ -895,6 +1255,8 @@ def _maybe_auto_install() -> None:
         or os.environ.get(FLAGOS_SOFTMAX_FUSED_ENV, "0") == "1"
         or os.environ.get(FLAGOS_SWIGLU_FUSED_ENV, "0") == "1"
         or os.environ.get(FLAGOS_ADD_RMSNORM_FUSED_ENV, "0") == "1"
+        or os.environ.get(FLAGOS_QKV_FUSED_ENV, "0") == "1"
+        or os.environ.get(FLAGOS_GATEUP_FUSED_ENV, "0") == "1"
     )
     if _any_on:
         _install_fusion_import_hook()
@@ -903,6 +1265,8 @@ def _maybe_auto_install() -> None:
         apply_fused_softmax()
         apply_fused_swiglu()
         apply_fused_add_rmsnorm()
+        apply_fused_qkv()
+        apply_fused_gate_up()
 
 
 _maybe_auto_install()
