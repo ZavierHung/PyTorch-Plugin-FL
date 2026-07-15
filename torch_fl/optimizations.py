@@ -837,6 +837,13 @@ def _get_fused_qkv_weight(self):
 
     Returns None if the module's q/k/v projections have a bias or otherwise
     don't fit the simple concat (in which case the caller falls back to HF).
+
+    INFERENCE-ONLY: the concat is cached under ``torch.no_grad()`` and never
+    invalidated, so it is correct only when q/k/v weights are frozen (the
+    decode-throughput use case these fusions target). Under training/finetuning
+    it would break autograd into q/k/v and go stale on weight updates — do not
+    enable ``FLAGOS_QKV_FUSED`` in that setting. Guarded by requiring frozen
+    weights in practice; kept minimal because the fusion is opt-in + default-off.
     """
     w = getattr(self, "_fused_qkv_weight", None)
     if w is not None:
@@ -1044,7 +1051,12 @@ _GATEUP_ORIG: Dict[str, object] = {}
 
 
 def _get_fused_gate_up_weight(self):
-    """Lazily build+cache the concatenated [gate; up] weight. None if biased."""
+    """Lazily build+cache the concatenated [gate; up] weight. None if biased.
+
+    INFERENCE-ONLY, same caveat as :func:`_get_fused_qkv_weight`: the cache is
+    built under ``torch.no_grad()`` and never invalidated, so it assumes frozen
+    weights. Do not enable ``FLAGOS_GATEUP_FUSED`` for training/finetuning.
+    """
     w = getattr(self, "_fused_gate_up_weight", None)
     if w is not None:
         return w
@@ -1179,8 +1191,18 @@ class _FusionImportHook(importlib.abc.MetaPathFinder):
     three fusions regardless of which combination is enabled.
     """
 
+    # Per-thread re-entry flag for the importlib.util.find_spec fallback (which
+    # re-walks sys.meta_path and would otherwise recurse back into this finder).
+    _active = threading.local()
+
     def find_spec(self, fullname, path, target=None):  # noqa: D401, ARG002
         if fullname not in _ALL_FUSION_TARGETS:
+            return None
+        # Re-entry guard: the util.find_spec fallback below walks sys.meta_path,
+        # which includes this finder again. Without the guard that recurses on
+        # the same fullname until the stack blows. A thread-local flag lets the
+        # nested call short-circuit to None (letting the real finders resolve).
+        if getattr(self._active, "flag", False):
             return None
         # Resolve the real spec using the remaining finders (skip ourselves to
         # avoid recursion). There is only one flagos finder now, so no mutual
@@ -1200,10 +1222,13 @@ class _FusionImportHook(importlib.abc.MetaPathFinder):
                 real_spec = spec
                 break
         if real_spec is None:
+            self._active.flag = True
             try:
                 real_spec = importlib.util.find_spec(fullname)
             except (ImportError, ValueError):
                 real_spec = None
+            finally:
+                self._active.flag = False
         if real_spec is None or real_spec.loader is None:
             return None
         real_loader = real_spec.loader
