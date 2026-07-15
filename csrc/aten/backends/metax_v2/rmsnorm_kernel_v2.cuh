@@ -54,62 +54,63 @@ __global__ void RmsNormRowKernel(
   constexpr int WARP = 64;
   constexpr int WARPS = BLOCK / WARP;  // = 4
 
-  // grid may exceed rows; extra blocks return early.
-  const int64_t row = static_cast<int64_t>(blockIdx.x);
-  if (row >= rows) {
-    return;
-  }
-
-  const scalar_t* __restrict__ row_in = in + row * hidden;
-  scalar_t* __restrict__ row_out = out + row * hidden;
-
-  // Pass 1: sum(x^2) in fp32.
-  acc_t thread_sum = acc_t(0);
-  for (int64_t i = threadIdx.x; i < hidden; i += BLOCK) {
-    const acc_t v = static_cast<acc_t>(__ldg(row_in + i));
-    thread_sum += v * v;
-  }
-
-  // Warp-level shuffle reduction (WARP=64, mask = 64 ones).
-  for (int offset = WARP / 2; offset > 0; offset >>= 1) {
-    thread_sum += __shfl_down_sync(0xffffffffffffffffull, thread_sum, offset);
-  }
-
-  // Cross-warp reduction via shared memory (each warp's lane 0 writes).
   __shared__ acc_t warp_sums[WARPS];
-
+  __shared__ acc_t scale_sh;
   const int lane = threadIdx.x & (WARP - 1);
   const int warp_id = threadIdx.x / WARP;
 
-  if (lane == 0) {
-    warp_sums[warp_id] = thread_sum;
-  }
-  __syncthreads();
+  // Grid-stride over rows: gridDim.x is clamped to kMaxGridV2, so for
+  // rows > kMaxGridV2 (large prefill) each block sweeps multiple rows instead
+  // of leaving the tail uncomputed.
+  for (int64_t row = static_cast<int64_t>(blockIdx.x); row < rows;
+       row += static_cast<int64_t>(gridDim.x)) {
+    const scalar_t* __restrict__ row_in = in + row * hidden;
+    scalar_t* __restrict__ row_out = out + row * hidden;
 
-  // warp 0 finishes the reduction and computes scale = rsqrt(mean + eps).
-  __shared__ acc_t scale_sh;
-
-  if (warp_id == 0) {
-    acc_t v = (threadIdx.x < WARPS) ? warp_sums[threadIdx.x] : acc_t(0);
-
-    for (int offset = WARPS / 2; offset > 0; offset >>= 1) {
-      v += __shfl_down_sync(0xffffffffffffffffull, v, offset);
+    // Pass 1: sum(x^2) in fp32.
+    acc_t thread_sum = acc_t(0);
+    for (int64_t i = threadIdx.x; i < hidden; i += BLOCK) {
+      const acc_t v = static_cast<acc_t>(__ldg(row_in + i));
+      thread_sum += v * v;
     }
 
-    if (threadIdx.x == 0) {
-      const acc_t mean = v / static_cast<acc_t>(hidden);
-      scale_sh = acc_t(1) / ::sqrt(mean + eps);
+    // Warp-level shuffle reduction (WARP=64, mask = 64 ones).
+    for (int offset = WARP / 2; offset > 0; offset >>= 1) {
+      thread_sum += __shfl_down_sync(0xffffffffffffffffull, thread_sum, offset);
     }
-  }
-  __syncthreads();
 
-  const acc_t scale = scale_sh;
+    // Cross-warp reduction via shared memory (each warp's lane 0 writes).
+    if (lane == 0) {
+      warp_sums[warp_id] = thread_sum;
+    }
+    __syncthreads();
 
-  // Pass 2: out = weight * x * scale.
-  for (int64_t i = threadIdx.x; i < hidden; i += BLOCK) {
-    const acc_t x = static_cast<acc_t>(__ldg(row_in + i));
-    const acc_t w = static_cast<acc_t>(__ldg(weight + i));
-    row_out[i] = static_cast<scalar_t>(w * x * scale);
+    // warp 0 finishes the reduction and computes scale = rsqrt(mean + eps).
+    if (warp_id == 0) {
+      acc_t v = (threadIdx.x < WARPS) ? warp_sums[threadIdx.x] : acc_t(0);
+
+      for (int offset = WARPS / 2; offset > 0; offset >>= 1) {
+        v += __shfl_down_sync(0xffffffffffffffffull, v, offset);
+      }
+
+      if (threadIdx.x == 0) {
+        const acc_t mean = v / static_cast<acc_t>(hidden);
+        scale_sh = acc_t(1) / ::sqrt(mean + eps);
+      }
+    }
+    __syncthreads();
+
+    const acc_t scale = scale_sh;
+
+    // Pass 2: out = weight * x * scale.
+    for (int64_t i = threadIdx.x; i < hidden; i += BLOCK) {
+      const acc_t x = static_cast<acc_t>(__ldg(row_in + i));
+      const acc_t w = static_cast<acc_t>(__ldg(weight + i));
+      row_out[i] = static_cast<scalar_t>(w * x * scale);
+    }
+
+    // Barrier before the next row reuses warp_sums / scale_sh.
+    __syncthreads();
   }
 }
 

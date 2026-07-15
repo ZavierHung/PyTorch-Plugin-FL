@@ -59,105 +59,110 @@ __global__ void MaskedSoftmaxKernel(
   constexpr int WARP = 64;
   constexpr int WARPS = BLOCK / WARP;
 
-  const int64_t row = static_cast<int64_t>(blockIdx.x);
-  if (row >= rows) {
-    return;
-  }
-
-  // row -> (b, h, q)
-  const int64_t q = row % q_len;
-  const int64_t h = (row / q_len) % heads;
-  const int64_t b = row / (q_len * heads);
-  const int64_t mask_row_base =
-      b * ms0 + h * ms1 + q * ms2;  // + k * ms3 added in the loop
-
-  const scalar_t* __restrict__ row_in = in + row * k_len;
-  scalar_t* __restrict__ row_out = out + row * k_len;
-
-  // Pass 1: row max in fp32, after applying scaling + mask.
-  acc_t thread_max = -INFINITY;
-  for (int64_t i = threadIdx.x; i < k_len; i += BLOCK) {
-    acc_t v = static_cast<acc_t>(__ldg(row_in + i)) * scaling;
-    if (mask != nullptr) {
-      v += static_cast<acc_t>(__ldg(mask + mask_row_base + i * ms3));
-    }
-    if (v > thread_max) {
-      thread_max = v;
-    }
-  }
-
-  // warp-level shuffle reduction (max)
-  for (int offset = WARP / 2; offset > 0; offset >>= 1) {
-    acc_t other = __shfl_down_sync(0xffffffffffffffffull, thread_max, offset);
-    if (other > thread_max) {
-      thread_max = other;
-    }
-  }
-
   __shared__ acc_t warp_sums[WARPS];
+  __shared__ acc_t max_sh;
+  __shared__ acc_t sum_sh;
   const int lane = threadIdx.x & (WARP - 1);
   const int warp_id = threadIdx.x / WARP;
-  if (lane == 0) {
-    warp_sums[warp_id] = thread_max;
-  }
-  __syncthreads();
 
-  __shared__ acc_t max_sh;
-  if (warp_id == 0) {
-    acc_t v = (threadIdx.x < WARPS) ? warp_sums[threadIdx.x] : -INFINITY;
-    for (int offset = WARPS / 2; offset > 0; offset >>= 1) {
-      acc_t other = __shfl_down_sync(0xffffffffffffffffull, v, offset);
-      if (other > v) {
-        v = other;
+  // Grid-stride over rows: gridDim.x is clamped to kMaxGridV2, so for
+  // rows > kMaxGridV2 (large batch/prefill) each block sweeps multiple rows
+  // instead of leaving the tail uninitialized.
+  for (int64_t row = static_cast<int64_t>(blockIdx.x); row < rows;
+       row += static_cast<int64_t>(gridDim.x)) {
+    // row -> (b, h, q)
+    const int64_t q = row % q_len;
+    const int64_t h = (row / q_len) % heads;
+    const int64_t b = row / (q_len * heads);
+    const int64_t mask_row_base =
+        b * ms0 + h * ms1 + q * ms2;  // + k * ms3 added in the loop
+
+    const scalar_t* __restrict__ row_in = in + row * k_len;
+    scalar_t* __restrict__ row_out = out + row * k_len;
+
+    // Pass 1: row max in fp32, after applying scaling + mask.
+    acc_t thread_max = -INFINITY;
+    for (int64_t i = threadIdx.x; i < k_len; i += BLOCK) {
+      acc_t v = static_cast<acc_t>(__ldg(row_in + i)) * scaling;
+      if (mask != nullptr) {
+        v += static_cast<acc_t>(__ldg(mask + mask_row_base + i * ms3));
+      }
+      if (v > thread_max) {
+        thread_max = v;
       }
     }
-    if (threadIdx.x == 0) {
-      max_sh = v;
-    }
-  }
-  __syncthreads();
-  const acc_t row_max = max_sh;
 
-  // Pass 2: sum(exp(s - max)) in fp32.
-  acc_t thread_sum = acc_t(0);
-  for (int64_t i = threadIdx.x; i < k_len; i += BLOCK) {
-    acc_t v = static_cast<acc_t>(__ldg(row_in + i)) * scaling;
-    if (mask != nullptr) {
-      v += static_cast<acc_t>(__ldg(mask + mask_row_base + i * ms3));
+    // warp-level shuffle reduction (max)
+    for (int offset = WARP / 2; offset > 0; offset >>= 1) {
+      acc_t other = __shfl_down_sync(0xffffffffffffffffull, thread_max, offset);
+      if (other > thread_max) {
+        thread_max = other;
+      }
     }
-    thread_sum += ::exp(v - row_max);
-  }
 
-  for (int offset = WARP / 2; offset > 0; offset >>= 1) {
-    thread_sum += __shfl_down_sync(0xffffffffffffffffull, thread_sum, offset);
-  }
-
-  if (lane == 0) {
-    warp_sums[warp_id] = thread_sum;
-  }
-  __syncthreads();
-
-  __shared__ acc_t sum_sh;
-  if (warp_id == 0) {
-    acc_t v = (threadIdx.x < WARPS) ? warp_sums[threadIdx.x] : acc_t(0);
-    for (int offset = WARPS / 2; offset > 0; offset >>= 1) {
-      v += __shfl_down_sync(0xffffffffffffffffull, v, offset);
+    if (lane == 0) {
+      warp_sums[warp_id] = thread_max;
     }
-    if (threadIdx.x == 0) {
-      sum_sh = v;
-    }
-  }
-  __syncthreads();
-  const acc_t row_sum = sum_sh;
+    __syncthreads();
 
-  // Pass 3: write exp(s - max) / sum, cast to scalar_t.
-  const acc_t inv_sum = (row_sum > acc_t(0)) ? (acc_t(1) / row_sum) : acc_t(0);
-  for (int64_t i = threadIdx.x; i < k_len; i += BLOCK) {
-    acc_t v = static_cast<acc_t>(__ldg(row_in + i)) * scaling;
-    if (mask != nullptr) {
-      v += static_cast<acc_t>(__ldg(mask + mask_row_base + i * ms3));
+    if (warp_id == 0) {
+      acc_t v = (threadIdx.x < WARPS) ? warp_sums[threadIdx.x] : -INFINITY;
+      for (int offset = WARPS / 2; offset > 0; offset >>= 1) {
+        acc_t other = __shfl_down_sync(0xffffffffffffffffull, v, offset);
+        if (other > v) {
+          v = other;
+        }
+      }
+      if (threadIdx.x == 0) {
+        max_sh = v;
+      }
     }
-    row_out[i] = static_cast<scalar_t>(::exp(v - row_max) * inv_sum);
+    __syncthreads();
+    const acc_t row_max = max_sh;
+
+    // Pass 2: sum(exp(s - max)) in fp32.
+    acc_t thread_sum = acc_t(0);
+    for (int64_t i = threadIdx.x; i < k_len; i += BLOCK) {
+      acc_t v = static_cast<acc_t>(__ldg(row_in + i)) * scaling;
+      if (mask != nullptr) {
+        v += static_cast<acc_t>(__ldg(mask + mask_row_base + i * ms3));
+      }
+      thread_sum += ::exp(v - row_max);
+    }
+
+    for (int offset = WARP / 2; offset > 0; offset >>= 1) {
+      thread_sum += __shfl_down_sync(0xffffffffffffffffull, thread_sum, offset);
+    }
+
+    if (lane == 0) {
+      warp_sums[warp_id] = thread_sum;
+    }
+    __syncthreads();
+
+    if (warp_id == 0) {
+      acc_t v = (threadIdx.x < WARPS) ? warp_sums[threadIdx.x] : acc_t(0);
+      for (int offset = WARPS / 2; offset > 0; offset >>= 1) {
+        v += __shfl_down_sync(0xffffffffffffffffull, v, offset);
+      }
+      if (threadIdx.x == 0) {
+        sum_sh = v;
+      }
+    }
+    __syncthreads();
+    const acc_t row_sum = sum_sh;
+
+    // Pass 3: write exp(s - max) / sum, cast to scalar_t.
+    const acc_t inv_sum = (row_sum > acc_t(0)) ? (acc_t(1) / row_sum) : acc_t(0);
+    for (int64_t i = threadIdx.x; i < k_len; i += BLOCK) {
+      acc_t v = static_cast<acc_t>(__ldg(row_in + i)) * scaling;
+      if (mask != nullptr) {
+        v += static_cast<acc_t>(__ldg(mask + mask_row_base + i * ms3));
+      }
+      row_out[i] = static_cast<scalar_t>(::exp(v - row_max) * inv_sum);
+    }
+
+    // Barrier before the next row reuses warp_sums / max_sh / sum_sh.
+    __syncthreads();
   }
 }
 
