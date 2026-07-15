@@ -342,6 +342,37 @@ from torch_fl.integration import (  # noqa: E402
     use_flaggems,
 )
 
+# Re-export optional fused RMSNorm patch (§2.2(b): single-kernel RMSNorm).
+# Auto-installs an import hook when FLAGOS_RMSNORM_FUSED=1.
+# Re-export optional fused RoPE patch (module-level apply_rotary_pos_emb).
+# Auto-installs an import hook when FLAGOS_ROPE_FUSED=1.
+# Re-export optional fused masked-softmax patch (module-level
+# eager_attention_forward). Auto-installs an import hook when
+# FLAGOS_SOFTMAX_FUSED=1.
+from torch_fl.optimizations import (  # noqa: E402
+    apply_fused_rmsnorm,
+    restore_rmsnorm,
+    is_rmsnorm_fused_active,
+    apply_fused_rope,
+    restore_rope,
+    is_rope_fused_active,
+    apply_fused_softmax,
+    restore_softmax,
+    is_softmax_fused_active,
+    apply_fused_swiglu,
+    restore_swiglu,
+    is_swiglu_fused_active,
+    apply_fused_add_rmsnorm,
+    restore_add_rmsnorm,
+    is_add_rmsnorm_fused_active,
+    apply_fused_qkv,
+    restore_qkv,
+    is_qkv_fused_active,
+    apply_fused_gate_up,
+    restore_gate_up,
+    is_gate_up_fused_active,
+)
+
 __all__ = [
     "flagos",
     "distributed",
@@ -350,4 +381,25 @@ __all__ = [
     "is_flaggems_available",
     "enable_flaggems_for_flagos",
     "use_flaggems",
+    "apply_fused_rmsnorm",
+    "restore_rmsnorm",
+    "is_rmsnorm_fused_active",
+    "apply_fused_rope",
+    "restore_rope",
+    "is_rope_fused_active",
+    "apply_fused_softmax",
+    "restore_softmax",
+    "is_softmax_fused_active",
+    "apply_fused_swiglu",
+    "restore_swiglu",
+    "is_swiglu_fused_active",
+    "apply_fused_add_rmsnorm",
+    "restore_add_rmsnorm",
+    "is_add_rmsnorm_fused_active",
+    "apply_fused_qkv",
+    "restore_qkv",
+    "is_qkv_fused_active",
+    "apply_fused_gate_up",
+    "restore_gate_up",
+    "is_gate_up_fused_active",
 ]

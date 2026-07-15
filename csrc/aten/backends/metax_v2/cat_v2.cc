@@ -109,9 +109,15 @@ at::Tensor CatKernelMetaxV2(const at::ITensorListRef& tensors, int64_t dim) {
   int64_t pre_dim = 1;
   for (int64_t d = 0; d < dim; ++d) pre_dim *= first.size(d);
 
-  // Fast path: contiguous + post_dim==1 → single concatenated memcpy per
-  // input tensor (already optimal — single DMA per input).
-  if (all_contiguous && post_dim == 1) {
+  // Fast path: contiguous + the entire output is a single run along the cat
+  // dim (pre_dim==1 && post_dim==1, i.e. 1-D cat or cat on the only non-1
+  // dim). Only then are the inputs contiguous runs that can be memcpy'd
+  // end-to-end. When pre_dim>1 && post_dim==1 (cat on the innermost dim with
+  // multiple rows) the inputs are contiguous but row-interleaved in the
+  // output — a single bulk memcpy would write input 0's full N rows then
+  // input 1's full N rows, instead of interleaving them per row. That case
+  // must fall through to the general per-pre-row kernel.
+  if (all_contiguous && post_dim == 1 && pre_dim == 1) {
     char* dst = static_cast<char*>(out.data_ptr());
     size_t written = 0;
     for (const auto* tp : views) {

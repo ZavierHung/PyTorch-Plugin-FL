@@ -21,6 +21,11 @@
 #include "mul.h"
 #include "rsqrt.h"
 #include "mean.h"
+#include "rmsnorm.h"
+#include "rope.h"
+#include "masked_softmax.h"
+#include "swiglu.h"
+#include "add_rms_norm.h"
 #include "cos.h"
 #include "sin.h"
 #include "pow.h"
@@ -315,6 +320,39 @@ at::Tensor WrapperMeanDim(
     const at::Tensor& self, at::OptionalIntArrayRef dim,
     bool keepdim, std::optional<at::ScalarType> dtype) {
   return at::native::flagos::mean_dim_dispatcher(self, dim, keepdim, dtype);
+}
+
+at::Tensor WrapperRmsNorm(
+    const at::Tensor& input, const at::Tensor& weight, double eps) {
+  return at::native::flagos::RmsNormV2(input, weight, eps);
+}
+
+std::tuple<at::Tensor, at::Tensor> WrapperRoPE(
+    const at::Tensor& q,
+    const at::Tensor& k,
+    const at::Tensor& cos,
+    const at::Tensor& sin,
+    int64_t unsqueeze_dim) {
+  return at::native::flagos::RoPEV2(q, k, cos, sin, unsqueeze_dim);
+}
+
+at::Tensor WrapperMaskedSoftmax(
+    const at::Tensor& attn_weights,
+    const c10::optional<at::Tensor>& mask,
+    double scaling) {
+  return at::native::flagos::MaskedSoftmaxV2(attn_weights, mask, scaling);
+}
+
+at::Tensor WrapperSwiGLU(const at::Tensor& gate, const at::Tensor& up) {
+  return at::native::flagos::SwiGLUV2(gate, up);
+}
+
+std::tuple<at::Tensor, at::Tensor> WrapperAddRmsNorm(
+    const at::Tensor& residual,
+    const at::Tensor& hidden,
+    const at::Tensor& weight,
+    double eps) {
+  return at::native::flagos::AddRmsNormV2(residual, hidden, weight, eps);
 }
 
 at::Tensor WrapperCos(const at::Tensor& self) {
@@ -689,6 +727,27 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("lt.Tensor", WrapperLtTensor);
   m.impl("lt.Scalar", WrapperLtScalar);
   m.impl("cumsum", WrapperCumsum);
+}
+
+// Fused RMSNorm custom op (flagos::rms_norm). Not an aten op — HF RMSNorm is a
+// hand-written pow/mean/rsqrt/mul chain, so it cannot be intercepted through
+// the dispatcher. torch_fl/optimizations.py patches HF *RMSNorm.forward to call
+// torch.ops.flagos.rms_norm when FLAGOS_RMSNORM_FUSED=1.
+// See docs/trace_optimization_plan_2026-07-06.md §2.2(b).
+TORCH_LIBRARY(flagos, m) {
+  m.def("rms_norm(Tensor input, Tensor weight, float eps) -> Tensor");
+  m.def("rope(Tensor q, Tensor k, Tensor cos, Tensor sin, int unsqueeze_dim) -> (Tensor, Tensor)");
+  m.def("masked_softmax(Tensor attn_weights, Tensor? mask, float scaling) -> Tensor");
+  m.def("swiglu(Tensor gate, Tensor up) -> Tensor");
+  m.def("add_rms_norm(Tensor residual, Tensor hidden, Tensor weight, float eps) -> (Tensor, Tensor)");
+}
+
+TORCH_LIBRARY_IMPL(flagos, PrivateUse1, m) {
+  m.impl("rms_norm", WrapperRmsNorm);
+  m.impl("rope", WrapperRoPE);
+  m.impl("masked_softmax", WrapperMaskedSoftmax);
+  m.impl("swiglu", WrapperSwiGLU);
+  m.impl("add_rms_norm", WrapperAddRmsNorm);
 }
 
 // Register fallback for all unimplemented operators
